@@ -21,6 +21,9 @@ lbr         search "article"
 
 linkbrarian tag "https://example.com/article" +reading +c
 lbr         tag "https://example.com/article" +reading
+
+linkbrarian delete "https://example.com/article"
+linkbrarian delete "https://example.com/article" --notes
 ```
 
 `linkbrarian` and `lbr` are equivalent commands; both are built from the same
@@ -228,6 +231,18 @@ lbr         tag "https://example.com/article" -c
 Running `tag` without operations prints the current tags. Tags are stored
 space-separated, sorted and unique. They cannot contain whitespace.
 
+### Delete
+
+```sh
+linkbrarian delete "https://example.com/article"
+linkbrarian delete "https://example.com/article" --notes
+```
+
+The database row is removed. Without `--notes`, the notes folder is left
+untouched and its path is printed. With `--notes`, the folder is removed
+recursively, but only if it resolves inside the `.linkbrarian` data directory;
+paths outside that directory are refused.
+
 ### Inspect the catalogue
 
 Unix-like systems:
@@ -433,6 +448,8 @@ profile. It covers:
 - valid and invalid URL handling
 - search by title, URL, tags and Unicode text
 - tag addition, removal, sorting and Unicode tags
+- link deletion with and without notes
+- recursive notes deletion and refusal to delete outside the data directory
 - `<title>`, `og:title`, entity decoding and host fallback
 - duplicate URLs and `n = 1`, `n = 2`
 - canonical URL identity for case, default ports, dot segments and percent

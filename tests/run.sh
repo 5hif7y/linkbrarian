@@ -476,6 +476,47 @@ expect_fail "tagging an unknown link fails"
 [ "$ST" = "5" ] || fail "tag not-found exit code should be 5"
 ok "tags can be added, removed and searched"
 
+# -------------------------------------------------------------- 5g: delete
+new_home delete
+run "$BIN" "$BASE/title.html" note
+expect_ok "save link with notes for deletion"
+notes=$(dbq "SELECT notes_path FROM links WHERE link = '$BASE/title.html';")
+printf 'keep me\n' >"$notes/extra.txt"
+run "$BIN" delete "$BASE/title.html"
+expect_ok "delete link without notes"
+[ "$(count_links)" = "0" ] || fail "link was not deleted"
+[ -d "$notes" ] || fail "notes were removed without --notes"
+out_has "Notes kept: $notes" "delete keep-notes output"
+run "$BIN" delete "$BASE/title.html"
+expect_fail "deleting a missing link fails"
+[ "$ST" = "5" ] || fail "delete not-found exit code should be 5"
+
+new_home delete-notes
+run "$BIN" "$BASE/title.html" note
+expect_ok "save link with notes for recursive deletion"
+notes=$(dbq "SELECT notes_path FROM links WHERE link = '$BASE/title.html';")
+printf 'extra\n' >"$notes/extra.txt"
+mkdir "$notes/sub"
+printf 'nested\n' >"$notes/sub/nested.txt"
+run "$BIN" delete "$BASE/title.html" --notes
+expect_ok "delete link with notes"
+[ "$(count_links)" = "0" ] || fail "link was not deleted with --notes"
+[ ! -d "$notes" ] || fail "notes directory was not removed recursively"
+out_has "Notes deleted: $notes" "delete notes output"
+
+new_home delete-safety
+run "$BIN" "$BASE/title.html"
+expect_ok "save link for notes safety test"
+outside="$TMP/outside-notes"
+mkdir -p "$outside"
+sqlite3 "$HOME/.linkbrarian/linkography.db" \
+	"UPDATE links SET notes_path = '$outside' WHERE link = '$BASE/title.html';"
+run "$BIN" delete "$BASE/title.html" --notes
+expect_fail "refuse to delete notes outside the data directory"
+[ "$(count_links)" = "1" ] || fail "unsafe delete removed the link row"
+[ -d "$outside" ] || fail "unsafe delete removed an outside directory"
+ok "delete removes links and notes safely"
+
 # ------------------------------------------------------- 6: duplicate URL
 new_home duplicate
 run "$BIN" "$BASE/title.html"

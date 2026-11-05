@@ -34,6 +34,7 @@
 #define strncasecmp _strnicmp
 #define PATHSEP '\\'
 #else
+#include <dirent.h>
 #include <fcntl.h>
 #include <strings.h>
 #include <unistd.h>
@@ -1581,6 +1582,130 @@ static int db_update_tags(sqlite3 *db, long long id, const char *tags)
 	return rc == SQLITE_DONE ? 0 : -1;
 }
 
+static int db_delete_link(sqlite3 *db, long long id)
+{
+	sqlite3_stmt *st = db_prepare(db, "DELETE FROM links WHERE id = ?1");
+	int rc;
+
+	sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+	rc = sqlite3_step(st);
+	sqlite3_finalize(st);
+	return rc == SQLITE_DONE ? 0 : -1;
+}
+
+static int path_within(const char *base, const char *path)
+{
+	char *b = absolute_path(base);
+	char *p = absolute_path(path);
+	int result = -1;
+
+	if (b && p) {
+		size_t n = strlen(b);
+
+		if (!strncmp(b, p, n) && (p[n] == '/' || p[n] == '\\'))
+			result = 1;
+		else
+			result = 0;
+	}
+	free(b);
+	free(p);
+	return result;
+}
+
+static int remove_tree(const char *path)
+{
+#ifdef _WIN32
+	wchar_t *wpath = utf8_to_wide(path);
+	wchar_t *pattern;
+	WIN32_FIND_DATAW fd;
+	HANDLE h;
+	DWORD attrs;
+	int ret = 0;
+
+	if (!wpath)
+		return -1;
+	attrs = GetFileAttributesW(wpath);
+	if (attrs == INVALID_FILE_ATTRIBUTES) {
+		DWORD saved = GetLastError();
+
+		free(wpath);
+		if (saved == ERROR_FILE_NOT_FOUND || saved == ERROR_PATH_NOT_FOUND)
+			return 0;
+		return -1;
+	}
+	if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+		int rc = remove_file(path);
+
+		if (rc != 0)
+			rc = remove_dir(path);
+		free(wpath);
+		return rc;
+	}
+	pattern = xmalloc((wcslen(wpath) + 3) * sizeof(*pattern));
+	wcscpy(pattern, wpath);
+	wcscat(pattern, L"\\*");
+	h = FindFirstFileW(pattern, &fd);
+	free(pattern);
+	if (h == INVALID_HANDLE_VALUE) {
+		free(wpath);
+		return remove_file(path);
+	}
+	do {
+		char *name, *child;
+
+		if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
+			continue;
+		name = wide_to_utf8(fd.cFileName);
+		if (!name) {
+			ret = -1;
+			continue;
+		}
+		child = path_join(path, name);
+		free(name);
+		if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+		    !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+			if (remove_tree(child) != 0)
+				ret = -1;
+		} else if (remove_file(child) != 0) {
+			ret = -1;
+		}
+		free(child);
+	} while (FindNextFileW(h, &fd));
+	FindClose(h);
+	free(wpath);
+	if (ret != 0)
+		return -1;
+	return remove_dir(path);
+#else
+	struct stat st;
+	DIR *dir;
+	struct dirent *entry;
+	int ret = 0;
+
+	if (lstat(path, &st) != 0)
+		return errno == ENOENT ? 0 : -1;
+	if (!S_ISDIR(st.st_mode))
+		return remove_file(path);
+	dir = opendir(path);
+	if (!dir)
+		return -1;
+	while ((entry = readdir(dir)) != NULL) {
+		char *child;
+
+		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+			continue;
+		child = path_join(path, entry->d_name);
+		if (remove_tree(child) != 0)
+			ret = -1;
+		free(child);
+	}
+	closedir(dir);
+	if (ret != 0)
+		return -1;
+	return remove_dir(path);
+#endif
+}
+
 /* ---------- notes ---------- */
 
 static int write_exclusive(const char *path, const char *content)
@@ -2025,6 +2150,84 @@ static int cmd_tag(int argc, char **argv)
 	return status;
 }
 
+static int cmd_delete(int argc, char **argv)
+{
+	struct catalog c;
+	struct link_row row;
+	char *host = NULL;
+	char *key;
+	const char *url;
+	int remove_notes = 0;
+	int status = 0;
+	int inside = 0;
+
+	if (argc < 1) {
+		fprintf(stderr, "usage: linkbrarian delete URL [--notes]\n");
+		return EXIT_USAGE;
+	}
+	url = argv[0];
+	if (argc > 1) {
+		if (argc > 2 || strcmp(argv[1], "--notes")) {
+			fprintf(stderr, "usage: linkbrarian delete URL [--notes]\n");
+			return EXIT_USAGE;
+		}
+		remove_notes = 1;
+	}
+	if (!valid_url(url, &host))
+		die(EXIT_BAD_URL, "invalid URL (expected absolute http or https): %s",
+		    url);
+	free(host);
+	key = canonical_url(url);
+
+	catalog_open(&c);
+	if (!db_find_link(c.db, url, key, &row)) {
+		catalog_close(&c);
+		free(key);
+		die(EXIT_NOT_FOUND, "link not found: %s", url);
+	}
+	if (row.notes_path && remove_notes) {
+		inside = path_within(c.data_dir, row.notes_path);
+		if (inside == 0)
+			die(EXIT_STORAGE,
+			    "refusing to remove notes outside the data directory: %s",
+			    row.notes_path);
+	}
+	if (db_delete_link(c.db, row.id) != 0) {
+		char *msg = xstrdup(sqlite3_errmsg(c.db));
+
+		free(row.page_name);
+		free(row.link);
+		free(row.notes_path);
+		catalog_close(&c);
+		free(key);
+		die(EXIT_STORAGE, "cannot delete link: %s", msg);
+	}
+
+	printf("[-] Link deleted: %s\n", row.page_name);
+	if (row.notes_path) {
+		if (!remove_notes) {
+			printf("[=] Notes kept: %s\n", row.notes_path);
+		} else if (inside != 1) {
+			fprintf(stderr,
+				"linkbrarian: warning: notes path could not be resolved; left untouched: %s\n",
+				row.notes_path);
+		} else if (remove_tree(row.notes_path) == 0) {
+			printf("[+] Notes deleted: %s\n", row.notes_path);
+		} else {
+			fprintf(stderr, "linkbrarian: cannot remove notes %s: %s\n",
+				row.notes_path, strerror(errno));
+			status = EXIT_STORAGE;
+		}
+	}
+
+	free(row.page_name);
+	free(row.link);
+	free(row.notes_path);
+	catalog_close(&c);
+	free(key);
+	return status;
+}
+
 /* ---------- CLI ---------- */
 
 static void usage(FILE *out)
@@ -2032,9 +2235,11 @@ static void usage(FILE *out)
 	fputs("usage: linkbrarian [-hv] URL [note]\n"
 	      "       linkbrarian search [QUERY]\n"
 	      "       linkbrarian tag URL [+TAG|-TAG ...]\n"
+	      "       linkbrarian delete URL [--notes]\n"
 	      "       lbr [-hv] URL [note]\n"
 	      "       lbr search [QUERY]\n"
-	      "       lbr tag URL [+TAG|-TAG ...]\n", out);
+	      "       lbr tag URL [+TAG|-TAG ...]\n"
+	      "       lbr delete URL [--notes]\n", out);
 }
 
 static void help(void)
@@ -2044,7 +2249,8 @@ static void help(void)
 	      "Register a URL in ~/.linkbrarian/linkography.db.\n"
 	      "With \"note\", also create a Markdown notes folder.\n"
 	      "With \"search\", find links by title, URL or tags.\n"
-	      "With \"tag\", add (+tag) or remove (-tag) tags.\n\n"
+	      "With \"tag\", add (+tag) or remove (-tag) tags.\n"
+	      "With \"delete\", remove a link; --notes also removes its folder.\n\n"
 	      "options:\n"
 	      "  -h, --help     show this help\n"
 	      "  -v, --version  show version\n", stdout);
@@ -2093,6 +2299,8 @@ int main(int argc, char **argv)
 		return cmd_search(argc - i - 1, argv + i + 1);
 	if (!strcmp(argv[i], "tag") || !strcmp(argv[i], "tags"))
 		return cmd_tag(argc - i - 1, argv + i + 1);
+	if (!strcmp(argv[i], "delete"))
+		return cmd_delete(argc - i - 1, argv + i + 1);
 	url = trim_dup(argv[i++]);
 	if (i < argc) {
 		if (!strcmp(argv[i], "note"))
