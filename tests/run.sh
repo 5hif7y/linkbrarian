@@ -440,6 +440,42 @@ expect_ok "search without a query lists all"
 out_has "2 link(s)" "list-all output"
 ok "search finds links by title, URL and Unicode text"
 
+# ---------------------------------------------------------------- 5f: tags
+new_home tags
+run "$BIN" "$BASE/title.html"
+expect_ok "save link for tagging"
+
+run "$BIN" tag "$BASE/title.html" +cli +c +cli
+expect_ok "add tags"
+out_has "Tags: c cli" "tag add output"
+[ "$(dbq "SELECT tags FROM links WHERE link = '$BASE/title.html';")" = "c cli" ] ||
+	fail "tags were not stored sorted and unique"
+
+run "$BIN" tag "$BASE/title.html"
+expect_ok "show tags"
+out_has "Tags: c cli" "tag show output"
+
+run "$BIN" search cli
+expect_ok "search by tag"
+out_has "Example & Article" "tag search output"
+
+run "$BIN" tag "$BASE/title.html" -c
+expect_ok "remove tag"
+out_has "Tags: cli" "tag remove output"
+
+run "$BIN" tag "$BASE/title.html" +тег
+expect_ok "add Unicode tag"
+[ "$(dbq "SELECT tags FROM links WHERE link = '$BASE/title.html';")" = "cli тег" ] ||
+	fail "Unicode tag was not stored"
+
+run "$BIN" tag "$BASE/title.html" "bad tag"
+expect_fail "tag with whitespace is rejected"
+
+run "$BIN" tag "$BASE/no-such-link.html" +x
+expect_fail "tagging an unknown link fails"
+[ "$ST" = "5" ] || fail "tag not-found exit code should be 5"
+ok "tags can be added, removed and searched"
+
 # ------------------------------------------------------- 6: duplicate URL
 new_home duplicate
 run "$BIN" "$BASE/title.html"

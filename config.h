@@ -16,6 +16,7 @@
 #define EXIT_BAD_URL 2
 #define EXIT_STORAGE 3
 #define EXIT_NOTES 4
+#define EXIT_NOT_FOUND 5
 
 /* SQLite schema version */
 #define SCHEMA_VERSION 3

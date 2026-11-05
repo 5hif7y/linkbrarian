@@ -18,6 +18,9 @@ lbr         "https://example.com/article" note
 
 linkbrarian search "article"
 lbr         search "article"
+
+linkbrarian tag "https://example.com/article" +reading +c
+lbr         tag "https://example.com/article" +reading
 ```
 
 `linkbrarian` and `lbr` are equivalent commands; both are built from the same
@@ -213,6 +216,18 @@ Example output:
 2. ...
 ```
 
+### Tags
+
+Add or remove tags with `+` and `-`; a bare tag is treated as an add:
+
+```sh
+linkbrarian tag "https://example.com/article" +reading +c
+lbr         tag "https://example.com/article" -c
+```
+
+Running `tag` without operations prints the current tags. Tags are stored
+space-separated, sorted and unique. They cannot contain whitespace.
+
 ### Inspect the catalogue
 
 Unix-like systems:
@@ -250,6 +265,7 @@ manually.
 | `2` | invalid URL |
 | `3` | storage or database error |
 | `4` | notes folder could not be created |
+| `5` | link not found |
 
 ## Storage
 
@@ -415,7 +431,8 @@ profile. It covers:
 
 - database and data-directory initialisation
 - valid and invalid URL handling
-- search by title, URL and Unicode text
+- search by title, URL, tags and Unicode text
+- tag addition, removal, sorting and Unicode tags
 - `<title>`, `og:title`, entity decoding and host fallback
 - duplicate URLs and `n = 1`, `n = 2`
 - canonical URL identity for case, default ports, dot segments and percent

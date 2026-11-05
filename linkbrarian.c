@@ -1552,6 +1552,35 @@ static int db_set_notes(sqlite3 *db, long long id, const char *path)
 	return changes;
 }
 
+static char *db_get_tags(sqlite3 *db, long long id)
+{
+	sqlite3_stmt *st = db_prepare(db,
+				      "SELECT tags FROM links WHERE id = ?1");
+	char *tags;
+
+	sqlite3_bind_int64(st, 1, (sqlite3_int64)id);
+	if (sqlite3_step(st) != SQLITE_ROW) {
+		sqlite3_finalize(st);
+		return NULL;
+	}
+	tags = column_text_dup(st, 0);
+	sqlite3_finalize(st);
+	return tags;
+}
+
+static int db_update_tags(sqlite3 *db, long long id, const char *tags)
+{
+	sqlite3_stmt *st = db_prepare(db,
+				      "UPDATE links SET tags = ?1 WHERE id = ?2");
+	int rc;
+
+	sqlite3_bind_text(st, 1, tags, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_int64(st, 2, (sqlite3_int64)id);
+	rc = sqlite3_step(st);
+	sqlite3_finalize(st);
+	return rc == SQLITE_DONE ? 0 : -1;
+}
+
 /* ---------- notes ---------- */
 
 static int write_exclusive(const char *path, const char *content)
@@ -1745,6 +1774,57 @@ static void strlist_free(struct strlist *l)
 	memset(l, 0, sizeof(*l));
 }
 
+static int strlist_contains(const struct strlist *l, const char *s)
+{
+	size_t i;
+
+	for (i = 0; i < l->n; i++) {
+		if (!strcmp(l->v[i], s))
+			return 1;
+	}
+	return 0;
+}
+
+static void strlist_remove(struct strlist *l, const char *s)
+{
+	size_t i;
+
+	for (i = 0; i < l->n; ) {
+		if (!strcmp(l->v[i], s)) {
+			free(l->v[i]);
+			memmove(&l->v[i], &l->v[i + 1],
+				(l->n - i - 1) * sizeof(*l->v));
+			l->n--;
+		} else {
+			i++;
+		}
+	}
+}
+
+static int cmp_string(const void *a, const void *b)
+{
+	return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static void strlist_sort(struct strlist *l)
+{
+	if (l->n > 1)
+		qsort(l->v, l->n, sizeof(*l->v), cmp_string);
+}
+
+static char *strlist_join(const struct strlist *l)
+{
+	struct sbuf out = {0};
+	size_t i;
+
+	for (i = 0; i < l->n; i++) {
+		if (i)
+			sb_add(&out, " ", 1);
+		sb_add(&out, l->v[i], strlen(l->v[i]));
+	}
+	return out.s ? out.s : xstrdup("");
+}
+
 static struct strlist split_words(const char *s)
 {
 	struct strlist l = {0};
@@ -1851,14 +1931,110 @@ static int cmd_search(int argc, char **argv)
 	return 0;
 }
 
+static int cmd_tag(int argc, char **argv)
+{
+	struct catalog c;
+	struct link_row row;
+	struct strlist tags;
+	char *host = NULL;
+	char *key;
+	char *current;
+	char *joined;
+	const char *url;
+	int i, status = 0;
+
+	if (argc < 1) {
+		fprintf(stderr, "usage: linkbrarian tag URL [+TAG|-TAG ...]\n");
+		return EXIT_USAGE;
+	}
+	url = argv[0];
+	if (!valid_url(url, &host))
+		die(EXIT_BAD_URL, "invalid URL (expected absolute http or https): %s",
+		    url);
+	free(host);
+	key = canonical_url(url);
+
+	catalog_open(&c);
+	db_exec(c.db, "BEGIN IMMEDIATE");
+	if (!db_find_link(c.db, url, key, &row)) {
+		db_exec(c.db, "ROLLBACK");
+		catalog_close(&c);
+		free(key);
+		die(EXIT_NOT_FOUND, "link not found: %s", url);
+	}
+	current = db_get_tags(c.db, row.id);
+	if (!current)
+		current = xstrdup("");
+	tags = split_words(current);
+
+	for (i = 1; i < argc; i++) {
+		const char *op = argv[i];
+		int remove = 0;
+		const char *name = op;
+
+		if (*name == '+' || *name == '-') {
+			remove = *name == '-';
+			name++;
+		}
+		if (!*name || strpbrk(name, " \t\r\n")) {
+			free(current);
+			strlist_free(&tags);
+			db_exec(c.db, "ROLLBACK");
+			free(row.page_name);
+			free(row.link);
+			free(row.notes_path);
+			catalog_close(&c);
+			free(key);
+			die(EXIT_USAGE, "invalid tag: %s", op);
+		}
+		if (remove)
+			strlist_remove(&tags, name);
+		else if (!strlist_contains(&tags, name))
+			strlist_push(&tags, xstrdup(name));
+	}
+	strlist_sort(&tags);
+	joined = strlist_join(&tags);
+	if (argc > 1 && db_update_tags(c.db, row.id, joined) != 0) {
+		char *msg = xstrdup(sqlite3_errmsg(c.db));
+
+		free(joined);
+		free(current);
+		strlist_free(&tags);
+		db_exec(c.db, "ROLLBACK");
+		free(row.page_name);
+		free(row.link);
+		free(row.notes_path);
+		catalog_close(&c);
+		free(key);
+		die(EXIT_STORAGE, "cannot update tags: %s", msg);
+	}
+	if (argc > 1)
+		db_exec(c.db, "COMMIT");
+	else
+		db_exec(c.db, "ROLLBACK");
+
+	printf("Tags: %s\n", *joined ? joined : "(none)");
+	free(joined);
+	free(current);
+	strlist_free(&tags);
+	free(row.page_name);
+	free(row.link);
+	free(row.notes_path);
+	catalog_close(&c);
+	free(key);
+	return status;
+}
+
 /* ---------- CLI ---------- */
 
 static void usage(FILE *out)
 {
 	fputs("usage: linkbrarian [-hv] URL [note]\n"
 	      "       linkbrarian search [QUERY]\n"
+	      "       linkbrarian tag URL [+TAG|-TAG ...]\n"
 	      "       lbr [-hv] URL [note]\n"
-	      "       lbr search [QUERY]\n", out);
+	      "       lbr search [QUERY]\n"
+	      "       lbr tag URL [+TAG|-TAG ...]\n", out);
 }
 
 static void help(void)
@@ -1867,7 +2043,8 @@ static void help(void)
 	fputs("\n"
 	      "Register a URL in ~/.linkbrarian/linkography.db.\n"
 	      "With \"note\", also create a Markdown notes folder.\n"
-	      "With \"search\", find links by title, URL or tags.\n\n"
+	      "With \"search\", find links by title, URL or tags.\n"
+	      "With \"tag\", add (+tag) or remove (-tag) tags.\n\n"
 	      "options:\n"
 	      "  -h, --help     show this help\n"
 	      "  -v, --version  show version\n", stdout);
@@ -1914,6 +2091,8 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(argv[i], "search"))
 		return cmd_search(argc - i - 1, argv + i + 1);
+	if (!strcmp(argv[i], "tag") || !strcmp(argv[i], "tags"))
+		return cmd_tag(argc - i - 1, argv + i + 1);
 	url = trim_dup(argv[i++]);
 	if (i < argc) {
 		if (!strcmp(argv[i], "note"))
