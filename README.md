@@ -15,6 +15,9 @@ lbr         "https://example.com/article"
 
 linkbrarian "https://example.com/article" note
 lbr         "https://example.com/article" note
+
+linkbrarian search "article"
+lbr         search "article"
 ```
 
 `linkbrarian` and `lbr` are equivalent commands; both are built from the same
@@ -186,6 +189,28 @@ To assign the notes folder to the first link afterwards:
 
 ```sh
 lbr "https://odin-lang.org/docs/overview/" note
+```
+
+### Search
+
+```sh
+linkbrarian search "python"
+lbr search "python"
+```
+
+The query is matched against the normalised title key, the URL and the tags.
+Multiple shell arguments are joined with spaces. Running `search` without a
+query lists every link.
+
+Example output:
+
+```text
+1. Extending and Embedding the Python Interpreter — Python 3.15.2 documentation
+   URL: https://docs.python.org/3/extending/index.html
+   Tags: -
+   Notes: /home/you/.linkbrarian/extending-and-embedding-the-python-interpreter-python-3-15-2-documentation-1-notes
+
+2. ...
 ```
 
 ### Inspect the catalogue
@@ -390,6 +415,7 @@ profile. It covers:
 
 - database and data-directory initialisation
 - valid and invalid URL handling
+- search by title, URL and Unicode text
 - `<title>`, `og:title`, entity decoding and host fallback
 - duplicate URLs and `n = 1`, `n = 2`
 - canonical URL identity for case, default ports, dot segments and percent

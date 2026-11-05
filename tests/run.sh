@@ -407,6 +407,39 @@ expect_ok "canonical lookup after migration"
 out_has "[=] Link already registered: A" "canonical lookup after migration"
 ok "v2 databases migrate to canonical link keys with conflict handling"
 
+# --------------------------------------------------------------- 5e: search
+new_home search
+run "$BIN" "$BASE/title.html"
+expect_ok "save searchable title"
+run "$BIN" "$BASE/unicode-cyrillic-note.html"
+expect_ok "save searchable Cyrillic title"
+
+run "$BIN" search "Example"
+expect_ok "search by title"
+out_has "Example & Article" "search title output"
+out_has "1 link(s)" "search title count"
+
+run "$BIN" search "example" "article"
+expect_ok "search with joined terms"
+out_has "Example & Article" "joined search output"
+
+run "$BIN" search "МОСКВА"
+expect_ok "search Unicode title"
+out_has "Москва" "Unicode search output"
+
+run "$BIN" search "title.html"
+expect_ok "search by URL"
+out_has "Example & Article" "URL search output"
+
+run "$BIN" search "no-such-link"
+expect_ok "empty search succeeds"
+out_has "No links found." "empty search output"
+
+run "$BIN" search
+expect_ok "search without a query lists all"
+out_has "2 link(s)" "list-all output"
+ok "search finds links by title, URL and Unicode text"
+
 # ------------------------------------------------------- 6: duplicate URL
 new_home duplicate
 run "$BIN" "$BASE/title.html"

@@ -1691,12 +1691,174 @@ static char *create_notes_directory(const char *data_dir, const char *page_name,
 	return result;
 }
 
+/* ---------- commands ---------- */
+
+struct catalog {
+	char *home;
+	char *data_dir;
+	char *db_path;
+	sqlite3 *db;
+};
+
+static void catalog_open(struct catalog *c)
+{
+	memset(c, 0, sizeof(*c));
+	c->home = home_directory();
+	c->data_dir = path_join(c->home, ".linkbrarian");
+	ensure_data_directory(c->data_dir);
+	c->db_path = path_join(c->data_dir, "linkography.db");
+	c->db = db_open(c->db_path);
+	db_init(c->db);
+}
+
+static void catalog_close(struct catalog *c)
+{
+	sqlite3_close(c->db);
+	free(c->home);
+	free(c->data_dir);
+	free(c->db_path);
+	memset(c, 0, sizeof(*c));
+}
+
+struct strlist {
+	char **v;
+	size_t n;
+	size_t cap;
+};
+
+static void strlist_push(struct strlist *l, char *s)
+{
+	if (l->n == l->cap) {
+		l->cap = l->cap ? l->cap * 2 : 8;
+		l->v = xrealloc(l->v, l->cap * sizeof(*l->v));
+	}
+	l->v[l->n++] = s;
+}
+
+static void strlist_free(struct strlist *l)
+{
+	size_t i;
+
+	for (i = 0; i < l->n; i++)
+		free(l->v[i]);
+	free(l->v);
+	memset(l, 0, sizeof(*l));
+}
+
+static struct strlist split_words(const char *s)
+{
+	struct strlist l = {0};
+	const char *p = s;
+
+	while (*p) {
+		const char *start;
+
+		while (*p && isspace((unsigned char)*p))
+			p++;
+		start = p;
+		while (*p && !isspace((unsigned char)*p))
+			p++;
+		if (p > start)
+			strlist_push(&l, xstrndup(start, (size_t)(p - start)));
+	}
+	return l;
+}
+
+static char *join_args(int argc, char **argv)
+{
+	struct sbuf out = {0};
+	int i;
+
+	for (i = 0; i < argc; i++) {
+		if (i)
+			sb_add(&out, " ", 1);
+		sb_add(&out, argv[i], strlen(argv[i]));
+	}
+	return out.s ? out.s : xstrdup("");
+}
+
+static int cmd_search(int argc, char **argv)
+{
+	struct catalog c;
+	struct strlist terms;
+	struct sbuf sql = {0};
+	sqlite3_stmt *st;
+	char *query = join_args(argc, argv);
+	unsigned long long count = 0;
+	size_t i;
+	int rc;
+
+	terms = split_words(query);
+	sb_add(&sql, "SELECT id, page_name, link, tags, notes_path, n"
+		     " FROM links",
+	       strlen("SELECT id, page_name, link, tags, notes_path, n"
+		      " FROM links"));
+	for (i = 0; i < terms.n; i++) {
+		char *frag = xasprintf(
+			" %s (instr(page_name_key, ?%d) > 0"
+			" OR instr(lower(link), lower(?%d)) > 0"
+			" OR instr(lower(tags), lower(?%d)) > 0)",
+			i ? "AND" : "WHERE", (int)(2 * i + 1),
+			(int)(2 * i + 2), (int)(2 * i + 2));
+
+		sb_add(&sql, frag, strlen(frag));
+		free(frag);
+	}
+	sb_add(&sql, " ORDER BY id", strlen(" ORDER BY id"));
+
+	catalog_open(&c);
+	st = db_prepare(c.db, sql.s);
+	for (i = 0; i < terms.n; i++) {
+		char *key = normalize_key(terms.v[i]);
+
+		sqlite3_bind_text(st, (int)(2 * i + 1), key, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(st, (int)(2 * i + 2), terms.v[i], -1,
+				  SQLITE_TRANSIENT);
+		free(key);
+	}
+	while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+		const char *name = (const char *)sqlite3_column_text(st, 1);
+		const char *link = (const char *)sqlite3_column_text(st, 2);
+		const char *tags = (const char *)sqlite3_column_text(st, 3);
+		const char *notes = (const char *)sqlite3_column_text(st, 4);
+
+		count++;
+		printf("%llu. %s\n", count, name ? name : "");
+		printf("   URL: %s\n", link ? link : "");
+		printf("   Tags: %s\n", tags && *tags ? tags : "-");
+		printf("   Notes: %s\n", notes ? notes : "-");
+	}
+	if (rc != SQLITE_DONE) {
+		char *msg = xstrdup(sqlite3_errmsg(c.db));
+
+		sqlite3_finalize(st);
+		catalog_close(&c);
+		free(query);
+		free(sql.s);
+		strlist_free(&terms);
+		die(EXIT_STORAGE, "database error: %s", msg);
+	}
+	sqlite3_finalize(st);
+	if (!count)
+		puts("No links found.");
+	else
+		printf("\n%llu link(s)\n", count);
+
+	free(query);
+	free(sql.s);
+	strlist_free(&terms);
+	catalog_close(&c);
+	return 0;
+}
+
 /* ---------- CLI ---------- */
 
 static void usage(FILE *out)
 {
 	fputs("usage: linkbrarian [-hv] URL [note]\n"
-	      "       lbr [-hv] URL [note]\n", out);
+	      "       linkbrarian search [QUERY]\n"
+	      "       lbr [-hv] URL [note]\n"
+	      "       lbr search [QUERY]\n", out);
 }
 
 static void help(void)
@@ -1704,7 +1866,8 @@ static void help(void)
 	usage(stdout);
 	fputs("\n"
 	      "Register a URL in ~/.linkbrarian/linkography.db.\n"
-	      "With \"note\", also create a Markdown notes folder.\n\n"
+	      "With \"note\", also create a Markdown notes folder.\n"
+	      "With \"search\", find links by title, URL or tags.\n\n"
 	      "options:\n"
 	      "  -h, --help     show this help\n"
 	      "  -v, --version  show version\n", stdout);
@@ -1749,6 +1912,8 @@ int main(int argc, char **argv)
 		usage(stderr);
 		return EXIT_USAGE;
 	}
+	if (!strcmp(argv[i], "search"))
+		return cmd_search(argc - i - 1, argv + i + 1);
 	url = trim_dup(argv[i++]);
 	if (i < argc) {
 		if (!strcmp(argv[i], "note"))
