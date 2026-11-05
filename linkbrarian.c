@@ -17,10 +17,15 @@
 
 #include <curl/curl.h>
 #include <sqlite3.h>
+#include <utf8proc.h>
 
 #include "config.h"
 
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <wchar.h>
 #include <direct.h>
 #include <fcntl.h>
 #include <io.h>
@@ -28,9 +33,6 @@
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
 #define PATHSEP '\\'
-#ifndef S_ISDIR
-#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
-#endif
 #else
 #include <fcntl.h>
 #include <strings.h>
@@ -142,10 +144,75 @@ static char *path_join(const char *a, const char *b)
 	return p;
 }
 
+#ifdef _WIN32
+static wchar_t *utf8_to_wide(const char *s)
+{
+	int n;
+	wchar_t *w;
+
+	n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, NULL, 0);
+	if (n <= 0) {
+		errno = EILSEQ;
+		return NULL;
+	}
+	w = xmalloc((size_t)n * sizeof(*w));
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, w, n) <= 0) {
+		free(w);
+		errno = EILSEQ;
+		return NULL;
+	}
+	return w;
+}
+
+static char *wide_to_utf8(const wchar_t *w)
+{
+	int n;
+	char *s;
+
+	n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+	if (n <= 0) {
+		errno = EILSEQ;
+		return NULL;
+	}
+	s = xmalloc((size_t)n);
+	if (WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL) <= 0) {
+		free(s);
+		errno = EILSEQ;
+		return NULL;
+	}
+	return s;
+}
+
+static char *win_env_utf8(const wchar_t *name)
+{
+	DWORD n = GetEnvironmentVariableW(name, NULL, 0);
+	wchar_t *w;
+	char *s;
+
+	if (n == 0)
+		return NULL;
+	w = xmalloc((size_t)n * sizeof(*w));
+	if (GetEnvironmentVariableW(name, w, n) == 0) {
+		free(w);
+		return NULL;
+	}
+	s = wide_to_utf8(w);
+	free(w);
+	return s;
+}
+#endif
+
 static int make_dir(const char *p)
 {
 #ifdef _WIN32
-	return _mkdir(p);
+	wchar_t *w = utf8_to_wide(p);
+	int rc;
+
+	if (!w)
+		return -1;
+	rc = _wmkdir(w);
+	free(w);
+	return rc;
 #else
 	return mkdir(p, 0700);
 #endif
@@ -154,7 +221,14 @@ static int make_dir(const char *p)
 static int remove_dir(const char *p)
 {
 #ifdef _WIN32
-	return _rmdir(p);
+	wchar_t *w = utf8_to_wide(p);
+	int rc;
+
+	if (!w)
+		return -1;
+	rc = _wrmdir(w);
+	free(w);
+	return rc;
 #else
 	return rmdir(p);
 #endif
@@ -163,25 +237,54 @@ static int remove_dir(const char *p)
 static int remove_file(const char *p)
 {
 #ifdef _WIN32
-	return _unlink(p);
+	wchar_t *w = utf8_to_wide(p);
+	int rc;
+
+	if (!w)
+		return -1;
+	rc = _wunlink(w);
+	free(w);
+	return rc;
 #else
 	return unlink(p);
+#endif
+}
+
+static int path_is_dir(const char *p)
+{
+#ifdef _WIN32
+	wchar_t *w = utf8_to_wide(p);
+	DWORD attrs;
+
+	if (!w)
+		return 0;
+	attrs = GetFileAttributesW(w);
+	free(w);
+	return attrs != INVALID_FILE_ATTRIBUTES &&
+	       (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+	struct stat st;
+
+	return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
 #endif
 }
 
 static char *absolute_path(const char *p)
 {
 #ifdef _WIN32
-	char *r = _fullpath(NULL, p, 0);
+	wchar_t *w = utf8_to_wide(p);
+	wchar_t *full;
+	char *r;
 
-	if (!r)
+	if (!w)
 		return NULL;
-	{
-		char *d = xstrdup(r);
-
-		free(r);
-		return d;
-	}
+	full = _wfullpath(NULL, w, 0);
+	free(w);
+	if (!full)
+		return NULL;
+	r = wide_to_utf8(full);
+	free(full);
+	return r;
 #else
 	char *r = realpath(p, NULL);
 
@@ -198,27 +301,30 @@ static char *absolute_path(const char *p)
 
 static char *home_directory(void)
 {
-	const char *home;
-
 #ifdef _WIN32
-	home = getenv("USERPROFILE");
+	char *home = win_env_utf8(L"USERPROFILE");
+
+	if (!home || !*home) {
+		free(home);
+		home = win_env_utf8(L"HOME");
+	}
 	if (!home || !*home)
-		home = getenv("HOME");
+		die(EXIT_STORAGE, "cannot determine the user home directory");
+	return home;
 #else
-	home = getenv("HOME");
-#endif
+	const char *home = getenv("HOME");
+
 	if (!home || !*home)
 		die(EXIT_STORAGE, "cannot determine the user home directory");
 	return xstrdup(home);
+#endif
 }
 
 static void ensure_data_directory(const char *path)
 {
-	struct stat st;
-
 	if (make_dir(path) == 0)
 		return;
-	if (errno == EEXIST && stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+	if (errno == EEXIST && path_is_dir(path))
 		return;
 	if (errno == EEXIST)
 		die(EXIT_STORAGE, "data directory %s exists but is not a directory", path);
@@ -310,17 +416,6 @@ static int wide_space(unsigned int cp)
 	       cp == 0x202f || cp == 0x205f || cp == 0x3000;
 }
 
-static unsigned int lower_cp(unsigned int cp)
-{
-	if (cp >= 'A' && cp <= 'Z')
-		return cp + 32;
-	if (cp >= 0xc0 && cp <= 0xde && cp != 0xd7)
-		return cp + 0x20;
-	if (cp == 0x178)
-		return 0xff;
-	return cp;
-}
-
 static char *trim_dup(const char *s)
 {
 	const unsigned char *start = (const unsigned char *)s;
@@ -351,8 +446,11 @@ static char *trim_dup(const char *s)
 
 static char *normalize_key(const char *s)
 {
+	utf8proc_uint8_t *folded =
+		utf8proc_NFKC_Casefold((const utf8proc_uint8_t *)s);
+	const unsigned char *p = folded ? (const unsigned char *)folded :
+					  (const unsigned char *)s;
 	struct sbuf out = {0};
-	const unsigned char *p = (const unsigned char *)s;
 	int pending_space = 0;
 
 	while (*p) {
@@ -370,39 +468,36 @@ static char *normalize_key(const char *s)
 				sb_add(&out, " ", 1);
 				pending_space = 0;
 			}
-			cp = lower_cp(cp);
+			cp = (unsigned int)utf8proc_tolower((utf8proc_int32_t)cp);
 			n = utf8_encode(cp, tmp);
 			sb_add(&out, tmp, (size_t)n);
 		}
 		p += len;
 	}
+	free(folded);
 	if (!out.s)
 		return xstrdup("");
 	return out.s;
 }
 
-static const char *latin_slug(unsigned int cp)
+static int slug_allowed(utf8proc_int32_t cp)
 {
-	if (cp >= 0xc0 && cp <= 0xde && cp != 0xd7)
-		cp += 0x20;
-	switch (cp) {
-	case 0xc6: return "ae";
-	case 0xe6: return "ae";
-	case 0xdf: return "ss";
-	case 0xf0: return "d";
-	case 0xf8: return "o";
-	case 0xfe: return "th";
-	case 0x153: return "oe";
+	switch (utf8proc_category(cp)) {
+	case UTF8PROC_CATEGORY_LU:
+	case UTF8PROC_CATEGORY_LL:
+	case UTF8PROC_CATEGORY_LT:
+	case UTF8PROC_CATEGORY_LM:
+	case UTF8PROC_CATEGORY_LO:
+	case UTF8PROC_CATEGORY_ND:
+	case UTF8PROC_CATEGORY_NL:
+	case UTF8PROC_CATEGORY_NO:
+	case UTF8PROC_CATEGORY_MN:
+	case UTF8PROC_CATEGORY_MC:
+	case UTF8PROC_CATEGORY_ME:
+		return 1;
+	default:
+		return 0;
 	}
-	if (cp >= 0xe0 && cp <= 0xe5) return "a";
-	if (cp == 0xe7) return "c";
-	if (cp >= 0xe8 && cp <= 0xeb) return "e";
-	if (cp >= 0xec && cp <= 0xef) return "i";
-	if (cp == 0xf1) return "n";
-	if (cp >= 0xf2 && cp <= 0xf6) return "o";
-	if (cp >= 0xf9 && cp <= 0xfc) return "u";
-	if (cp == 0xfd || cp == 0xff) return "y";
-	return NULL;
 }
 
 static int reserved_slug(const char *s)
@@ -419,49 +514,35 @@ static int reserved_slug(const char *s)
 
 static char *slugify(const char *name)
 {
+	utf8proc_uint8_t *folded =
+		utf8proc_NFKC_Casefold((const utf8proc_uint8_t *)name);
+	const unsigned char *p = folded ? (const unsigned char *)folded :
+					  (const unsigned char *)name;
 	struct sbuf out = {0};
-	const unsigned char *p = (const unsigned char *)name;
 	int last_dash = 0;
 	char *slug;
 
 	while (*p) {
 		unsigned int cp;
 		size_t len = utf8_decode(p, &cp);
-		const char *map = NULL;
-		char one[2] = {0, 0};
 
-		if (cp < 0x80) {
-			if (isalnum((int)cp)) {
-				one[0] = (char)tolower((int)cp);
-				map = one;
-			} else {
-				map = "-";
-			}
-		} else {
-			map = latin_slug(cp);
-			if (!map)
-				map = "-";
-		}
+		if (slug_allowed((utf8proc_int32_t)cp)) {
+			char tmp[4];
+			int n;
 
-		if (map) {
-			const char *q = map;
-
-			while (*q) {
-				if (*q == '-') {
-					if (out.len && !last_dash && out.len < SLUG_MAX_BYTES)
-						sb_add(&out, "-", 1);
-					last_dash = 1;
-				} else {
-					if (out.len < SLUG_MAX_BYTES) {
-						sb_add(&out, q, 1);
-						last_dash = 0;
-					}
-				}
-				q++;
-			}
+			cp = (unsigned int)utf8proc_tolower((utf8proc_int32_t)cp);
+			n = utf8_encode(cp, tmp);
+			if (out.len + (size_t)n > SLUG_MAX_BYTES)
+				break;
+			sb_add(&out, tmp, (size_t)n);
+			last_dash = 0;
+		} else if (out.len && !last_dash && out.len < SLUG_MAX_BYTES) {
+			sb_add(&out, "-", 1);
+			last_dash = 1;
 		}
 		p += len;
 	}
+	free(folded);
 	if (!out.s)
 		return xstrdup("link");
 	while (out.len && out.s[out.len - 1] == '-') {
@@ -904,6 +985,116 @@ static int db_user_version(sqlite3 *db)
 	return version;
 }
 
+static const char links_columns[] =
+	" ("
+	" id INTEGER PRIMARY KEY,"
+	" page_name TEXT NOT NULL,"
+	" page_name_key TEXT NOT NULL,"
+	" link TEXT NOT NULL UNIQUE,"
+	" tags TEXT NOT NULL DEFAULT '',"
+	" notes_path TEXT,"
+	" n INTEGER NOT NULL CHECK (n >= 1),"
+	" created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+	" UNIQUE (page_name_key, n))";
+
+static void db_create_links_table(sqlite3 *db, const char *table, int if_not_exists)
+{
+	char *sql = xasprintf("CREATE TABLE %s%s%s",
+			      if_not_exists ? "IF NOT EXISTS " : "",
+			      table, links_columns);
+
+	db_exec(db, sql);
+	free(sql);
+}
+
+static void bind_text_or_null(sqlite3_stmt *dst, int dst_col,
+			      sqlite3_stmt *src, int src_col)
+{
+	if (sqlite3_column_type(src, src_col) == SQLITE_NULL)
+		sqlite3_bind_null(dst, dst_col);
+	else
+		sqlite3_bind_text(dst, dst_col,
+				  (const char *)sqlite3_column_text(src, src_col),
+				  -1, SQLITE_TRANSIENT);
+}
+
+static void db_migrate_v1_to_v2(sqlite3 *db)
+{
+	sqlite3_stmt *select, *insert, *next;
+	int rc;
+
+	db_create_links_table(db, "links_v2", 0);
+	select = db_prepare(db,
+			    "SELECT id, page_name, link, tags, notes_path, n,"
+			    " created_at FROM links ORDER BY id");
+	insert = db_prepare(db,
+			    "INSERT INTO links_v2"
+			    " (id, page_name, page_name_key, link, tags,"
+			    "  notes_path, n, created_at)"
+			    " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)");
+	next = db_prepare(db,
+			  "SELECT COALESCE(MAX(n), 0) + 1 FROM links_v2"
+			  " WHERE page_name_key = ?1");
+
+	while ((rc = sqlite3_step(select)) == SQLITE_ROW) {
+		const char *page_name =
+			(const char *)sqlite3_column_text(select, 1);
+		char *key = normalize_key(page_name ? page_name : "");
+		long long n;
+
+		sqlite3_reset(next);
+		sqlite3_clear_bindings(next);
+		sqlite3_bind_text(next, 1, key, -1, SQLITE_TRANSIENT);
+		if (sqlite3_step(next) != SQLITE_ROW) {
+			free(key);
+			sqlite3_finalize(select);
+			sqlite3_finalize(insert);
+			sqlite3_finalize(next);
+			die(EXIT_STORAGE, "database migration failed: %s",
+			    sqlite3_errmsg(db));
+		}
+		n = (long long)sqlite3_column_int64(next, 0);
+
+		sqlite3_reset(insert);
+		sqlite3_clear_bindings(insert);
+		sqlite3_bind_int64(insert, 1, sqlite3_column_int64(select, 0));
+		sqlite3_bind_text(insert, 2, page_name ? page_name : "", -1,
+				  SQLITE_TRANSIENT);
+		sqlite3_bind_text(insert, 3, key, -1, SQLITE_TRANSIENT);
+		bind_text_or_null(insert, 4, select, 2);
+		bind_text_or_null(insert, 5, select, 3);
+		bind_text_or_null(insert, 6, select, 4);
+		sqlite3_bind_int64(insert, 7, (sqlite3_int64)n);
+		bind_text_or_null(insert, 8, select, 6);
+		free(key);
+
+		if (sqlite3_step(insert) != SQLITE_DONE) {
+			sqlite3_finalize(select);
+			sqlite3_finalize(insert);
+			sqlite3_finalize(next);
+			die(EXIT_STORAGE, "database migration failed: %s",
+			    sqlite3_errmsg(db));
+		}
+	}
+	if (rc != SQLITE_DONE) {
+		sqlite3_finalize(select);
+		sqlite3_finalize(insert);
+		sqlite3_finalize(next);
+		die(EXIT_STORAGE, "database migration failed: %s",
+		    sqlite3_errmsg(db));
+	}
+	sqlite3_finalize(select);
+	sqlite3_finalize(insert);
+	sqlite3_finalize(next);
+
+	db_exec(db, "DROP TABLE links");
+	db_exec(db, "ALTER TABLE links_v2 RENAME TO links");
+	db_exec(db,
+		"CREATE INDEX IF NOT EXISTS idx_links_page_name"
+		" ON links (page_name_key)");
+	db_exec(db, "PRAGMA user_version = 2");
+}
+
 static void db_init(sqlite3 *db)
 {
 	int version = db_user_version(db);
@@ -911,11 +1102,11 @@ static void db_init(sqlite3 *db)
 	if (version > SCHEMA_VERSION)
 		die(EXIT_STORAGE, "database schema %d is newer than supported schema %d",
 		    version, SCHEMA_VERSION);
-	if (version == 0) {
+	if (version == 0 || version == 1) {
 		/*
-		 * BEGIN IMMEDIATE serialises schema creation. The version is read
-		 * again after taking the write lock, because another process may
-		 * have initialised the database while this one waited.
+		 * BEGIN IMMEDIATE serialises schema creation and migration. The
+		 * version is read again after taking the write lock, because another
+		 * process may have initialised the database while this one waited.
 		 */
 		db_exec(db, "BEGIN IMMEDIATE");
 		version = db_user_version(db);
@@ -926,21 +1117,13 @@ static void db_init(sqlite3 *db)
 			    version, SCHEMA_VERSION);
 		}
 		if (version == 0) {
-			db_exec(db,
-				"CREATE TABLE IF NOT EXISTS links ("
-				" id INTEGER PRIMARY KEY,"
-				" page_name TEXT NOT NULL,"
-				" page_name_key TEXT NOT NULL,"
-				" link TEXT NOT NULL UNIQUE,"
-				" tags TEXT NOT NULL DEFAULT '',"
-				" notes_path TEXT,"
-				" n INTEGER NOT NULL CHECK (n >= 1),"
-				" created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-				" UNIQUE (page_name_key, n))");
+			db_create_links_table(db, "links", 1);
 			db_exec(db,
 				"CREATE INDEX IF NOT EXISTS idx_links_page_name"
 				" ON links (page_name_key)");
-			db_exec(db, "PRAGMA user_version = 1");
+			db_exec(db, "PRAGMA user_version = 2");
+		} else if (version == 1) {
+			db_migrate_v1_to_v2(db);
 		}
 		db_exec(db, "COMMIT");
 	}
@@ -1080,8 +1263,14 @@ static int db_set_notes(sqlite3 *db, long long id, const char *path)
 static int write_exclusive(const char *path, const char *content)
 {
 #ifdef _WIN32
-	int fd = _open(path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
-		       _S_IREAD | _S_IWRITE);
+	wchar_t *wpath = utf8_to_wide(path);
+	int fd;
+
+	if (!wpath)
+		return -1;
+	fd = _wopen(wpath, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+		    _S_IREAD | _S_IWRITE);
+	free(wpath);
 #else
 	int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
 #endif
@@ -1091,11 +1280,12 @@ static int write_exclusive(const char *path, const char *content)
 		return -1;
 	while (off < len) {
 #ifdef _WIN32
-		int w = _write(fd, content + off, (unsigned int)(len - off));
+		int written = _write(fd, content + off,
+				     (unsigned int)(len - off));
 #else
-		ssize_t w = write(fd, content + off, len - off);
+		ssize_t written = write(fd, content + off, len - off);
 #endif
-		if (w < 0) {
+		if (written < 0) {
 			int saved = errno;
 
 #ifdef _WIN32
@@ -1106,7 +1296,7 @@ static int write_exclusive(const char *path, const char *content)
 			errno = saved;
 			return -1;
 		}
-		off += (size_t)w;
+		off += (size_t)written;
 	}
 #ifdef _WIN32
 	if (_close(fd) != 0)
@@ -1235,22 +1425,26 @@ int main(int argc, char **argv)
 	sqlite3 *db = NULL;
 	struct link_row row;
 
-	if (argc > 1 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
-		help();
-		return 0;
-	}
-	if (argc > 1 && (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--version"))) {
-		puts(VERSION);
-		return 0;
-	}
+#ifdef _WIN32
+	SetConsoleOutputCP(CP_UTF8);
+#endif
 
-	for (i = 1; i < argc; i++) {
+	i = 1;
+	while (i < argc) {
 		arg = argv[i];
 		if (arg[0] != '-' || arg[1] == '\0')
 			break;
 		if (!strcmp(arg, "--")) {
 			i++;
 			break;
+		}
+		if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
+			help();
+			return 0;
+		}
+		if (!strcmp(arg, "-v") || !strcmp(arg, "--version")) {
+			puts(VERSION);
+			return 0;
 		}
 		fprintf(stderr, "linkbrarian: unknown option %s\n", arg);
 		usage(stderr);

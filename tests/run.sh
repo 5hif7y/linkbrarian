@@ -119,7 +119,7 @@ run "$BIN" "$BASE/title.html"
 expect_ok "register a valid URL"
 [ -d "$HOME/.linkbrarian" ] || fail "data directory was not created"
 [ -f "$HOME/.linkbrarian/linkography.db" ] || fail "database was not created"
-[ "$(dbq 'PRAGMA user_version;')" = "1" ] || fail "schema version is not 1"
+[ "$(dbq 'PRAGMA user_version;')" = "2" ] || fail "schema version is not 2"
 [ "$(count_links)" = "1" ] || fail "expected one link"
 row=$(dbq "SELECT page_name || '|' || link || '|' || tags || '|' || COALESCE(notes_path, 'NULL') || '|' || n FROM links;")
 [ "$row" = "Example & Article|$BASE/title.html||NULL|1" ] ||
@@ -208,6 +208,120 @@ expect_ok "title with inline markup saved"
 [ "$(name_for "$BASE/inline.html")" = "Inline Bold Title" ] ||
 	fail "inline tags inside title were not stripped"
 ok "title and og:title extraction"
+
+# ------------------------------------------------ 5b: Unicode title grouping
+new_home unicode-keys
+run "$BIN" "$BASE/unicode-strasse.html"
+expect_ok "save Straße"
+run "$BIN" "$BASE/unicode-strasse-upper.html"
+expect_ok "save STRASSE"
+[ "$(dbq "SELECT count(DISTINCT page_name_key) FROM links WHERE link IN ('$BASE/unicode-strasse.html', '$BASE/unicode-strasse-upper.html');")" = "1" ] ||
+	fail "Straße and STRASSE did not share a page_name_key"
+
+run "$BIN" "$BASE/unicode-sigma-upper.html"
+expect_ok "save uppercase sigma"
+run "$BIN" "$BASE/unicode-sigma-lower.html"
+expect_ok "save lowercase sigma"
+run "$BIN" "$BASE/unicode-sigma-final.html"
+expect_ok "save final sigma"
+[ "$(dbq "SELECT count(DISTINCT page_name_key) FROM links WHERE link IN ('$BASE/unicode-sigma-upper.html', '$BASE/unicode-sigma-lower.html', '$BASE/unicode-sigma-final.html');")" = "1" ] ||
+	fail "sigma variants did not share a page_name_key"
+
+run "$BIN" "$BASE/unicode-cyrillic-upper.html"
+expect_ok "save uppercase Cyrillic"
+run "$BIN" "$BASE/unicode-cyrillic-lower.html"
+expect_ok "save lowercase Cyrillic"
+[ "$(dbq "SELECT count(DISTINCT page_name_key) FROM links WHERE link IN ('$BASE/unicode-cyrillic-upper.html', '$BASE/unicode-cyrillic-lower.html');")" = "1" ] ||
+	fail "Cyrillic case variants did not share a page_name_key"
+
+run "$BIN" "$BASE/unicode-fullwidth.html"
+expect_ok "save fullwidth A"
+run "$BIN" "$BASE/unicode-ascii-a.html"
+expect_ok "save ASCII A"
+[ "$(dbq "SELECT count(DISTINCT page_name_key) FROM links WHERE link IN ('$BASE/unicode-fullwidth.html', '$BASE/unicode-ascii-a.html');")" = "1" ] ||
+	fail "fullwidth and ASCII A did not share a page_name_key"
+
+run "$BIN" "$BASE/unicode-composed.html"
+expect_ok "save composed Café"
+run "$BIN" "$BASE/unicode-decomposed.html"
+expect_ok "save decomposed Café"
+[ "$(dbq "SELECT count(DISTINCT page_name_key) FROM links WHERE link IN ('$BASE/unicode-composed.html', '$BASE/unicode-decomposed.html');")" = "1" ] ||
+	fail "composed and decomposed Café did not share a page_name_key"
+
+[ "$(dbq "SELECT group_concat(n, ',') FROM (SELECT n FROM links WHERE link IN ('$BASE/unicode-strasse.html', '$BASE/unicode-strasse-upper.html') ORDER BY id);")" = "1,2" ] ||
+	fail "Unicode-equivalent titles did not receive sequential n values"
+ok "NFKC casefold groups Unicode-equivalent titles"
+
+# ------------------------------------------------- 5c: Unicode notes slugs
+new_home unicode-slugs
+run "$BIN" "$BASE/unicode-cyrillic-note.html" note
+expect_ok "save Cyrillic title with notes"
+notes=$(dbq "SELECT notes_path FROM links WHERE link = '$BASE/unicode-cyrillic-note.html';")
+[ "$(basename "$notes")" = "москва-1-notes" ] ||
+	fail "unexpected Cyrillic slug: $(basename "$notes")"
+[ -f "$notes/README.md" ] || fail "Cyrillic notes README missing"
+
+run "$BIN" "$BASE/unicode-cjk-note.html" note
+expect_ok "save CJK title with notes"
+notes=$(dbq "SELECT notes_path FROM links WHERE link = '$BASE/unicode-cjk-note.html';")
+[ "$(basename "$notes")" = "東京-1-notes" ] ||
+	fail "unexpected CJK slug: $(basename "$notes")"
+[ -f "$notes/README.md" ] || fail "CJK notes README missing"
+
+run "$BIN" "$BASE/unicode-emoji-note.html" note
+expect_ok "save emoji title with notes"
+notes=$(dbq "SELECT notes_path FROM links WHERE link = '$BASE/unicode-emoji-note.html';")
+[ "$(basename "$notes")" = "rocket-notes-1-notes" ] ||
+	fail "unexpected emoji slug: $(basename "$notes")"
+[ -f "$notes/README.md" ] || fail "emoji notes README missing"
+
+run "$BIN" "$BASE/unicode-strasse.html" note
+expect_ok "save sharp-s title with notes"
+notes=$(dbq "SELECT notes_path FROM links WHERE link = '$BASE/unicode-strasse.html';")
+[ "$(basename "$notes")" = "strasse-1-notes" ] ||
+	fail "unexpected sharp-s slug: $(basename "$notes")"
+ok "Unicode notes slugs are readable and filesystem-safe"
+
+# ------------------------------------------------ 5d: v1 database migration
+new_home migration
+mkdir -p "$HOME/.linkbrarian"
+sqlite3 "$HOME/.linkbrarian/linkography.db" <<SQL
+PRAGMA user_version = 1;
+CREATE TABLE links (
+    id INTEGER PRIMARY KEY,
+    page_name TEXT NOT NULL,
+    page_name_key TEXT NOT NULL,
+    link TEXT NOT NULL UNIQUE,
+    tags TEXT NOT NULL DEFAULT '',
+    notes_path TEXT,
+    n INTEGER NOT NULL CHECK (n >= 1),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (page_name_key, n)
+);
+CREATE INDEX idx_links_page_name ON links (page_name_key);
+INSERT INTO links (id, page_name, page_name_key, link, tags, notes_path, n, created_at)
+VALUES (1, 'Straße', 'straße', 'https://example.com/a', '', NULL, 1, '2020-01-01 00:00:00');
+INSERT INTO links (id, page_name, page_name_key, link, tags, notes_path, n, created_at)
+VALUES (2, 'STRASSE', 'strasse', 'https://example.com/b', '', NULL, 1, '2020-01-02 00:00:00');
+INSERT INTO links (id, page_name, page_name_key, link, tags, notes_path, n, created_at)
+VALUES (3, '東京', '東京', 'https://example.com/c', '', '/tmp/old-notes', 1, '2020-01-03 00:00:00');
+SQL
+run "$BIN" "https://example.com/a"
+expect_ok "open and migrate v1 database"
+[ "$(dbq 'PRAGMA user_version;')" = "2" ] || fail "v1 database was not migrated to v2"
+[ "$(dbq 'SELECT page_name_key FROM links WHERE id = 1;')" = "strasse" ] ||
+	fail "migration did not recompute page_name_key"
+[ "$(dbq 'SELECT n FROM links WHERE id = 2;')" = "2" ] ||
+	fail "migration did not renumber colliding titles"
+[ "$(dbq 'SELECT n FROM links WHERE id = 3;')" = "1" ] ||
+	fail "migration changed an unrelated n value"
+[ "$(dbq 'SELECT page_name FROM links WHERE id = 1;')" = "Straße" ] ||
+	fail "migration changed the visible page_name"
+[ "$(dbq 'SELECT notes_path FROM links WHERE id = 3;')" = "/tmp/old-notes" ] ||
+	fail "migration changed notes_path"
+[ "$(dbq 'SELECT created_at FROM links WHERE id = 1;')" = "2020-01-01 00:00:00" ] ||
+	fail "migration changed created_at"
+ok "v1 databases migrate to NFKC keys without touching notes"
 
 # ------------------------------------------------------- 6: duplicate URL
 new_home duplicate

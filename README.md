@@ -28,25 +28,27 @@ source and use the same database.
   - MSVC 2019 16.7+ on Windows (C11 mode is selected for MSVC)
 - SQLite 3 development files
 - libcurl development files
+- utf8proc development files (Unicode normalization and case folding)
 - `sqlite3` command-line tool, only for the test suite
 
 System package examples:
 
 ```sh
 # Alpine
-apk add build-base cmake sqlite sqlite-dev curl-dev
+apk add build-base cmake sqlite sqlite-dev curl-dev utf8proc-dev
 
 # Debian / Ubuntu
-apt install build-essential cmake libsqlite3-dev libcurl4-openssl-dev sqlite3
+apt install build-essential cmake libsqlite3-dev libcurl4-openssl-dev \
+            libutf8proc-dev sqlite3
 
 # macOS (Homebrew)
-brew install cmake sqlite curl
+brew install cmake sqlite curl utf8proc
 ```
 
 On Windows, install the dependencies with vcpkg:
 
 ```powershell
-vcpkg install sqlite3:x64-windows curl:x64-windows
+vcpkg install sqlite3:x64-windows curl:x64-windows utf8proc:x64-windows
 ```
 
 ## Build
@@ -98,8 +100,9 @@ Windows:
 cmake --install build --config Release --prefix C:\Tools\linkbrarian
 ```
 
-Both `linkbrarian` and `lbr` are installed. Add the chosen `bin` directory to
-`PATH` if necessary.
+Both `linkbrarian` and `lbr` are installed. With CMake 3.21 or newer, the vcpkg
+runtime DLLs are copied next to the executables automatically. Add the chosen
+`bin` directory to `PATH` if necessary.
 
 ## Usage
 
@@ -261,9 +264,10 @@ case-insensitively.
 - Different URLs with the same visible title are distinct records.
 - `n` starts at `1` for the first record of a title and increments for each
   additional URL with the same title.
-- Grouping uses `page_name_key`: Unicode whitespace is collapsed, surrounding
-  whitespace is removed and case is folded for ASCII and Latin-1 characters.
-  The visible `page_name` keeps its original casing and interior spacing.
+- Grouping uses `page_name_key`: the title is normalised with Unicode
+  NFKC case folding, Unicode whitespace is collapsed and surrounding whitespace
+  is removed. The visible `page_name` keeps its original casing, compatibility
+  forms and interior spacing.
 - `n` is allocated and inserted inside a `BEGIN IMMEDIATE` SQLite transaction,
   so concurrent runs cannot reuse the same number.
 
@@ -275,14 +279,18 @@ With `note`, the program creates:
 <data-directory>/<slug>-<N>-notes/README.md
 ```
 
-`<slug>` is a portable ASCII slug derived from the title. Invalid characters are
-replaced with `-`, trailing dashes are removed, Windows reserved names are
-prefixed with `link-`, and the component is limited to 80 bytes. If two titles
-produce the same slug, a stable numeric disambiguator is appended:
+`<slug>` is a portable, lower-case Unicode slug derived from the title
+(NFKC case folding). Letters, numbers and combining marks are kept; separators,
+punctuation, symbols and control characters become `-`. Trailing dashes are
+removed, Windows reserved names are prefixed with `link-`, and the component is
+limited to 80 UTF-8 bytes. If two titles produce the same slug, a stable numeric
+disambiguator is appended:
 
 ```text
 collision-test-1-notes
 collision-test-1-notes-2
+москва-1-notes
+東京-1-notes
 ```
 
 The folder is created atomically. An existing folder or `README.md` is never
@@ -307,9 +315,13 @@ The initial `README.md` is written as UTF-8:
 link row is kept without a notes path. If the path was created but the database
 update fails, only the files created by that operation are removed.
 
+On Windows, filesystem operations convert UTF-8 paths to UTF-16 and use the
+wide-character APIs, so Unicode slugs work independently of the active ANSI
+code page.
+
 ## Data model
 
-Schema version `1`, tracked with `PRAGMA user_version`:
+Schema version `2`, tracked with `PRAGMA user_version`:
 
 ```sql
 CREATE TABLE IF NOT EXISTS links (
@@ -331,6 +343,13 @@ CREATE INDEX IF NOT EXISTS idx_links_page_name
 Initialisation is idempotent and does not destroy an existing database. A
 database with a newer schema version is rejected rather than modified.
 
+Databases created with schema version `1` are migrated in place on first open:
+
+- `page_name_key` is recomputed for every row with NFKC case folding.
+- `n` is renumbered sequentially per new key, preserving row ids and
+  `created_at`.
+- `notes_path` is preserved exactly; existing note folders are not renamed.
+
 ## Tests
 
 Unix-like systems:
@@ -347,6 +366,9 @@ profile. It covers:
 - valid and invalid URL handling
 - `<title>`, `og:title`, entity decoding and host fallback
 - duplicate URLs and `n = 1`, `n = 2`
+- NFKC case folding for Unicode-equivalent titles
+- Unicode notes slugs (Cyrillic, CJK, emoji)
+- migration of schema version `1` databases to version `2`
 - notes creation, existing links without notes, and non-destructive repeats
 - special characters and slug collisions
 - filesystem failure without broken `notes_path` references
@@ -366,9 +388,11 @@ bypasses Unix mode bits.
    optionally install as shown above.
 
 The Windows build uses the native path separator and `%USERPROFILE%` for the
-home directory. `linkbrarian.exe` and `lbr.exe` are separate executables; the
-program does not depend on `argv[0]`. The automated fixture tests are not built
-on Windows because the harness is POSIX shell.
+home directory. Filesystem operations use UTF-16 wide-character APIs, so
+Unicode note folder names do not depend on the active ANSI code page.
+`linkbrarian.exe` and `lbr.exe` are separate executables; the program does not
+depend on `argv[0]`. The automated fixture tests are not built on Windows
+because the harness is POSIX shell.
 
 ## Limits
 
@@ -379,10 +403,8 @@ transcription downloads.
 Additional implementation notes:
 
 - HTML is assumed to be UTF-8; no charset conversion is performed.
-- `page_name_key` performs Unicode whitespace normalisation but only ASCII and
-  Latin-1 case folding, so unusual scripts are compared case-sensitively.
-- Slugs are ASCII, so titles written only in non-Latin scripts fall back to the
-  name `link` (with collision disambiguators).
-- URL comparison is conservative: only surrounding whitespace is trimmed.
+- URL comparison is conservative by design: only surrounding whitespace is
+  trimmed. Query strings, fragments and trailing slashes are preserved, so
+  trivially different spellings may be stored as separate links.
 - Notes are ordinary files owned by the user; the database stores only their
   folder path.
