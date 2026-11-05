@@ -1377,6 +1377,19 @@ static int db_migrate_v2_to_v3(sqlite3 *db)
 	return conflicts;
 }
 
+static int db_table_exists(sqlite3 *db, const char *table)
+{
+	sqlite3_stmt *st = db_prepare(db,
+				      "SELECT 1 FROM sqlite_master"
+				      " WHERE type = 'table' AND name = ?1");
+	int found;
+
+	sqlite3_bind_text(st, 1, table, -1, SQLITE_TRANSIENT);
+	found = sqlite3_step(st) == SQLITE_ROW;
+	sqlite3_finalize(st);
+	return found;
+}
+
 static void db_init(sqlite3 *db)
 {
 	int version = db_user_version(db);
@@ -1400,11 +1413,16 @@ static void db_init(sqlite3 *db)
 			    version, SCHEMA_VERSION);
 		}
 		if (version == 0) {
-			db_create_links_table(db, "links", 1);
-			db_exec(db,
-				"CREATE INDEX IF NOT EXISTS idx_links_page_name"
-				" ON links (page_name_key)");
-			conflicts = db_migrate_v2_to_v3(db);
+			if (db_table_exists(db, "links")) {
+				db_migrate_v1_to_v2(db);
+				conflicts = db_migrate_v2_to_v3(db);
+			} else {
+				db_create_links_table(db, "links", 1);
+				db_exec(db,
+					"CREATE INDEX IF NOT EXISTS idx_links_page_name"
+					" ON links (page_name_key)");
+				conflicts = db_migrate_v2_to_v3(db);
+			}
 		} else {
 			if (version == 1)
 				db_migrate_v1_to_v2(db);
@@ -1665,6 +1683,9 @@ static int remove_tree(const char *path)
 		if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
 		    !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
 			if (remove_tree(child) != 0)
+				ret = -1;
+		} else if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+			if (remove_file(child) != 0 && remove_dir(child) != 0)
 				ret = -1;
 		} else if (remove_file(child) != 0) {
 			ret = -1;
@@ -1954,14 +1975,15 @@ static struct strlist split_words(const char *s)
 {
 	struct strlist l = {0};
 	const char *p = s;
+	const char *end = s + strlen(s);
 
-	while (*p) {
+	while (p < end) {
 		const char *start;
 
-		while (*p && isspace((unsigned char)*p))
+		while (p < end && isspace((unsigned char)*p))
 			p++;
 		start = p;
-		while (*p && !isspace((unsigned char)*p))
+		while (p < end && !isspace((unsigned char)*p))
 			p++;
 		if (p > start)
 			strlist_push(&l, xstrndup(start, (size_t)(p - start)));

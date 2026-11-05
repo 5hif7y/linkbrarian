@@ -338,7 +338,8 @@ case-insensitively.
 - percent escapes are upper-cased and only unreserved characters are decoded;
 - path dot segments are removed.
 
-Path case, query strings, fragments, userinfo and trailing slashes are kept
+Path percent escapes are normalised; query and fragment escapes are left
+untouched. Path case, query strings, fragments, userinfo and trailing slashes are kept
 exactly. This means `HTTP://EXAMPLE.com:80/a/../b` and
 `http://example.com/b` identify the same link, while `?x=1`, `?x=2`,
 `#one`, `#two` and `/path/` vs `/path` remain distinct.
@@ -514,5 +515,10 @@ Additional implementation notes:
 - URL identity is conservative by design: canonicalisation does not merge path
   case, query strings, fragments, trailing slashes, userinfo or Unicode/IDN host
   variants.
+- Search is Unicode-aware for titles. URL and tag matching use SQLite's ASCII
+  case-insensitive `lower()`, so non-ASCII tags are matched exactly.
+- Windows paths beyond the legacy `MAX_PATH` limit are not specially handled.
+- `delete --notes` removes the database row first. If recursive file removal
+  then fails, the row is already gone and the error is reported.
 - Notes are ordinary files owned by the user; the database stores only their
   folder path.

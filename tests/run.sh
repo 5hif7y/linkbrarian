@@ -325,6 +325,32 @@ expect_ok "open and migrate v1 database"
 	fail "v1 migration did not add canonical link_key"
 ok "v1 databases migrate to NFKC keys without touching notes"
 
+# ---------------------------------------------- 5d2: unversioned existing table
+new_home zero-version
+mkdir -p "$HOME/.linkbrarian"
+sqlite3 "$HOME/.linkbrarian/linkography.db" <<SQL
+PRAGMA user_version = 0;
+CREATE TABLE links (
+    id INTEGER PRIMARY KEY,
+    page_name TEXT NOT NULL,
+    page_name_key TEXT NOT NULL,
+    link TEXT NOT NULL UNIQUE,
+    tags TEXT NOT NULL DEFAULT '',
+    notes_path TEXT,
+    n INTEGER NOT NULL CHECK (n >= 1),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (page_name_key, n)
+);
+INSERT INTO links (page_name, page_name_key, link, n)
+VALUES ('Zero', 'zero', 'https://example.com/zero', 1);
+SQL
+run "$BIN" "https://example.com/zero"
+expect_ok "open an unversioned existing table"
+[ "$(dbq 'PRAGMA user_version;')" = "3" ] || fail "unversioned table was not migrated"
+[ "$(dbq 'SELECT link_key FROM links WHERE id = 1;')" = "https://example.com/zero" ] ||
+	fail "unversioned table did not get a link_key"
+ok "unversioned existing tables are migrated safely"
+
 # ------------------------------------------------- 6a: canonical URL identity
 new_home url-identity
 run "$BIN" "$BASE/title.html"
