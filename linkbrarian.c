@@ -2228,6 +2228,174 @@ static int cmd_delete(int argc, char **argv)
 	return status;
 }
 
+static void json_string(const char *s)
+{
+	const unsigned char *p = (const unsigned char *)(s ? s : "");
+
+	putchar('"');
+	for (; *p; p++) {
+		switch (*p) {
+		case '"': fputs("\\\"", stdout); break;
+		case '\\': fputs("\\\\", stdout); break;
+		case '\b': fputs("\\b", stdout); break;
+		case '\f': fputs("\\f", stdout); break;
+		case '\n': fputs("\\n", stdout); break;
+		case '\r': fputs("\\r", stdout); break;
+		case '\t': fputs("\\t", stdout); break;
+		default:
+			if (*p < 0x20)
+				printf("\\u%04x", *p);
+			else
+				putchar(*p);
+			break;
+		}
+	}
+	putchar('"');
+}
+
+static void csv_field(const char *s)
+{
+	int quote = s && strpbrk(s, ",\"\r\n") != NULL;
+
+	if (quote)
+		putchar('"');
+	if (s) {
+		for (; *s; s++) {
+			if (*s == '"')
+				putchar('"');
+			putchar(*s);
+		}
+	}
+	if (quote)
+		putchar('"');
+}
+
+static void markdown_field(const char *s)
+{
+	if (!s)
+		return;
+	for (; *s; s++) {
+		if (*s == '|')
+			fputs("\\|", stdout);
+		else if (*s == '\n' || *s == '\r')
+			fputs("<br>", stdout);
+		else
+			putchar(*s);
+	}
+}
+
+static int cmd_export(int argc, char **argv)
+{
+	struct catalog c;
+	sqlite3_stmt *st;
+	const char *format = "json";
+	int rc, first = 1;
+
+	if (argc > 1) {
+		fprintf(stderr, "usage: linkbrarian export [json|csv|markdown]\n");
+		return EXIT_USAGE;
+	}
+	if (argc == 1) {
+		if (strcmp(argv[0], "json") && strcmp(argv[0], "csv") &&
+		    strcmp(argv[0], "markdown") && strcmp(argv[0], "md")) {
+			fprintf(stderr, "linkbrarian: unknown export format: %s\n",
+				argv[0]);
+			return EXIT_USAGE;
+		}
+		format = argv[0];
+	}
+
+	catalog_open(&c);
+	st = db_prepare(c.db,
+			"SELECT id, page_name, link, link_key, tags, notes_path,"
+			" n, created_at FROM links ORDER BY id");
+	if (!strcmp(format, "json")) {
+		puts("[");
+	} else if (!strcmp(format, "csv")) {
+		puts("id,page_name,link,link_key,tags,notes_path,n,created_at");
+	} else {
+		puts("| ID | Page name | URL | Tags | Notes | N | Created |");
+		puts("|---:|---|---|---|---|---:|---|");
+	}
+
+	while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+		long long id = (long long)sqlite3_column_int64(st, 0);
+		const char *name = (const char *)sqlite3_column_text(st, 1);
+		const char *link = (const char *)sqlite3_column_text(st, 2);
+		const char *link_key = (const char *)sqlite3_column_text(st, 3);
+		const char *tags = (const char *)sqlite3_column_text(st, 4);
+		const char *notes = (const char *)sqlite3_column_text(st, 5);
+		long long n = (long long)sqlite3_column_int64(st, 6);
+		const char *created = (const char *)sqlite3_column_text(st, 7);
+
+		if (!strcmp(format, "json")) {
+			if (!first)
+				puts(",");
+			printf("  {\n"
+			       "    \"id\": %lld,\n"
+			       "    \"page_name\": ", id);
+			json_string(name);
+			fputs(",\n    \"link\": ", stdout);
+			json_string(link);
+			fputs(",\n    \"link_key\": ", stdout);
+			if (link_key)
+				json_string(link_key);
+			else
+				fputs("null", stdout);
+			fputs(",\n    \"tags\": ", stdout);
+			json_string(tags);
+			fputs(",\n    \"notes_path\": ", stdout);
+			if (notes)
+				json_string(notes);
+			else
+				fputs("null", stdout);
+			printf(",\n    \"n\": %lld,\n"
+			       "    \"created_at\": ", n);
+			json_string(created);
+			fputs("\n  }", stdout);
+		} else if (!strcmp(format, "csv")) {
+			printf("%lld,", id);
+			csv_field(name);
+			putchar(',');
+			csv_field(link);
+			putchar(',');
+			csv_field(link_key);
+			putchar(',');
+			csv_field(tags);
+			putchar(',');
+			csv_field(notes);
+			printf(",%lld,", n);
+			csv_field(created);
+			putchar('\n');
+		} else {
+			printf("| %lld | ", id);
+			markdown_field(name);
+			fputs(" | ", stdout);
+			markdown_field(link);
+			fputs(" | ", stdout);
+			markdown_field(tags);
+			fputs(" | ", stdout);
+			markdown_field(notes);
+			printf(" | %lld | ", n);
+			markdown_field(created);
+			fputs(" |\n", stdout);
+		}
+		first = 0;
+	}
+	if (rc != SQLITE_DONE) {
+		char *msg = xstrdup(sqlite3_errmsg(c.db));
+
+		sqlite3_finalize(st);
+		catalog_close(&c);
+		die(EXIT_STORAGE, "database error: %s", msg);
+	}
+	sqlite3_finalize(st);
+	if (!strcmp(format, "json"))
+		puts("\n]");
+	catalog_close(&c);
+	return 0;
+}
+
 /* ---------- CLI ---------- */
 
 static void usage(FILE *out)
@@ -2236,10 +2404,12 @@ static void usage(FILE *out)
 	      "       linkbrarian search [QUERY]\n"
 	      "       linkbrarian tag URL [+TAG|-TAG ...]\n"
 	      "       linkbrarian delete URL [--notes]\n"
+	      "       linkbrarian export [json|csv|markdown]\n"
 	      "       lbr [-hv] URL [note]\n"
 	      "       lbr search [QUERY]\n"
 	      "       lbr tag URL [+TAG|-TAG ...]\n"
-	      "       lbr delete URL [--notes]\n", out);
+	      "       lbr delete URL [--notes]\n"
+	      "       lbr export [json|csv|markdown]\n", out);
 }
 
 static void help(void)
@@ -2250,7 +2420,8 @@ static void help(void)
 	      "With \"note\", also create a Markdown notes folder.\n"
 	      "With \"search\", find links by title, URL or tags.\n"
 	      "With \"tag\", add (+tag) or remove (-tag) tags.\n"
-	      "With \"delete\", remove a link; --notes also removes its folder.\n\n"
+	      "With \"delete\", remove a link; --notes also removes its folder.\n"
+	      "With \"export\", print the catalogue as JSON, CSV or Markdown.\n\n"
 	      "options:\n"
 	      "  -h, --help     show this help\n"
 	      "  -v, --version  show version\n", stdout);
@@ -2301,6 +2472,8 @@ int main(int argc, char **argv)
 		return cmd_tag(argc - i - 1, argv + i + 1);
 	if (!strcmp(argv[i], "delete"))
 		return cmd_delete(argc - i - 1, argv + i + 1);
+	if (!strcmp(argv[i], "export"))
+		return cmd_export(argc - i - 1, argv + i + 1);
 	url = trim_dup(argv[i++]);
 	if (i < argc) {
 		if (!strcmp(argv[i], "note"))

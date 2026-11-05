@@ -517,6 +517,47 @@ expect_fail "refuse to delete notes outside the data directory"
 [ -d "$outside" ] || fail "unsafe delete removed an outside directory"
 ok "delete removes links and notes safely"
 
+# -------------------------------------------------------------- 5h: export
+new_home export
+run "$BIN" "$BASE/title.html" note
+expect_ok "save export link with notes"
+run "$BIN" tag "$BASE/title.html" +c
+expect_ok "tag export link"
+run "$BIN" "$BASE/og.html"
+expect_ok "save quoted export title"
+run "$BIN" "$BASE/comma.html"
+expect_ok "save comma export title"
+run "$BIN" "$BASE/pipe.html"
+expect_ok "save pipe export title"
+
+run "$BIN" export
+expect_ok "default JSON export"
+out_has '"page_name": "Example & Article"' "JSON page name"
+out_has '"link_key": "http://127.0.0.1:' "JSON link key"
+out_has '"tags": "c"' "JSON tags"
+out_has '"notes_path": "' "JSON notes path"
+out_has '\"Title\"' "JSON quote escaping"
+
+run "$BIN" export json
+expect_ok "explicit JSON export"
+out_has '\"Title\"' "explicit JSON quote escaping"
+
+run "$BIN" export csv
+expect_ok "CSV export"
+out_has "id,page_name,link,link_key,tags,notes_path,n,created_at" "CSV header"
+out_has '"OG Fallback ""Title"""' "CSV quote escaping"
+out_has '"Comma, Title"' "CSV comma escaping"
+
+run "$BIN" export markdown
+expect_ok "Markdown export"
+out_has "| ID | Page name | URL | Tags | Notes | N | Created |" "Markdown header"
+out_has 'A \| B' "Markdown pipe escaping"
+
+run "$BIN" export yaml
+expect_fail "unknown export format is rejected"
+[ "$ST" = "1" ] || fail "unknown export format should exit 1"
+ok "export emits JSON, CSV and Markdown"
+
 # ------------------------------------------------------- 6: duplicate URL
 new_home duplicate
 run "$BIN" "$BASE/title.html"

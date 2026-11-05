@@ -24,6 +24,7 @@ lbr         tag "https://example.com/article" +reading
 
 linkbrarian delete "https://example.com/article"
 linkbrarian delete "https://example.com/article" --notes
+linkbrarian export json
 ```
 
 `linkbrarian` and `lbr` are equivalent commands; both are built from the same
@@ -243,6 +244,20 @@ untouched and its path is printed. With `--notes`, the folder is removed
 recursively, but only if it resolves inside the `.linkbrarian` data directory;
 paths outside that directory are refused.
 
+### Export
+
+```sh
+linkbrarian export            # JSON (default)
+linkbrarian export json
+linkbrarian export csv
+linkbrarian export markdown
+```
+
+Exports include `id`, `page_name`, `link`, `link_key`, `tags`, `notes_path`,
+`n` and `created_at`. JSON uses `null` for a missing notes path or link key;
+CSV quotes fields containing commas, quotes or newlines; Markdown escapes
+pipes and line breaks.
+
 ### Inspect the catalogue
 
 Unix-like systems:
@@ -450,6 +465,7 @@ profile. It covers:
 - tag addition, removal, sorting and Unicode tags
 - link deletion with and without notes
 - recursive notes deletion and refusal to delete outside the data directory
+- JSON, CSV and Markdown export, including escaping
 - `<title>`, `og:title`, entity decoding and host fallback
 - duplicate URLs and `n = 1`, `n = 2`
 - canonical URL identity for case, default ports, dot segments and percent
