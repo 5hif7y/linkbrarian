@@ -5,10 +5,9 @@ keeping a Markdown notes folder next to each one. It stores its catalogue in
 SQLite under the user's home directory, independent of the current working
 directory.
 
-The design is deliberately minimal: one C99 translation unit, a small
-`config.h`, a plain `Makefile`, SQLite for storage and libcurl for fetching page
-metadata. There is no daemon, no browser, no JavaScript execution and no
-network sync.
+The implementation is deliberately compact: one C99 translation unit, a small
+`config.h`, SQLite for storage and libcurl for fetching page metadata. There is
+no daemon, no browser, no JavaScript execution and no network sync.
 
 ```sh
 linkbrarian "https://example.com/article"
@@ -18,55 +17,89 @@ linkbrarian "https://example.com/article" note
 lbr         "https://example.com/article" note
 ```
 
+`linkbrarian` and `lbr` are equivalent commands; both are built from the same
+source and use the same database.
+
 ## Requirements
 
-- A C99 compiler (`cc`, `gcc` or `clang`)
-- `make`
+- CMake 3.16 or newer
+- A C compiler:
+  - GCC or Clang for Unix-like systems
+  - MSVC 2019 16.7+ on Windows (C11 mode is selected for MSVC)
 - SQLite 3 development files
 - libcurl development files
-- `sqlite3` command-line tool for the test suite
+- `sqlite3` command-line tool, only for the test suite
 
-Examples:
+System package examples:
 
 ```sh
 # Alpine
-apk add build-base sqlite sqlite-dev curl-dev
+apk add build-base cmake sqlite sqlite-dev curl-dev
 
 # Debian / Ubuntu
-apt install build-essential libsqlite3-dev libcurl4-openssl-dev sqlite3
+apt install build-essential cmake libsqlite3-dev libcurl4-openssl-dev sqlite3
+
+# macOS (Homebrew)
+brew install cmake sqlite curl
+```
+
+On Windows, install the dependencies with vcpkg:
+
+```powershell
+vcpkg install sqlite3:x64-windows curl:x64-windows
 ```
 
 ## Build
 
+Unix-like systems:
+
 ```sh
-make
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
 
-This produces:
+To build with Clang instead of the default compiler:
 
-- `linkbrarian` - the main executable
-- `lbr` - the equivalent short-name executable
-- `tests/httpd` - the local fixture server used by the tests
+```sh
+cmake -S . -B build -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
 
-Both command names run the same program and use the same database.
+Windows with MSVC and vcpkg:
+
+```powershell
+cmake -S . -B build -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
+cmake --build build --config Release
+```
+
+The build produces:
+
+| Platform | Main executable | Alias |
+|---|---|---|
+| Unix-like | `build/linkbrarian` | `build/lbr` |
+| Windows | `build\Release\linkbrarian.exe` | `build\Release\lbr.exe` |
+
+The optional test fixture server is built only on Unix-like systems. CMake also
+works with the Ninja generator, for example
+`cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release`.
 
 ## Install
 
-```sh
-make install
-```
-
-The default prefix is `/usr/local`; override it as usual:
+Unix-like systems:
 
 ```sh
-make install PREFIX="$HOME/.local"
+cmake --install build --prefix "$HOME/.local"
 ```
 
-Uninstall with:
+Windows:
 
-```sh
-make uninstall
+```powershell
+cmake --install build --config Release --prefix C:\Tools\linkbrarian
 ```
+
+Both `linkbrarian` and `lbr` are installed. Add the chosen `bin` directory to
+`PATH` if necessary.
 
 ## Usage
 
@@ -75,7 +108,8 @@ linkbrarian [-hv] URL [note]
 lbr         [-hv] URL [note]
 ```
 
-- `URL` must be an absolute `http://` or `https://` URL.
+- `URL` must be an absolute `http://` or `https://` URL. Surrounding
+  whitespace is ignored; query strings and fragments are preserved.
 - `note` is the only optional positional argument. It creates a notes folder
   and an initial `README.md`.
 - Extra positional arguments are rejected.
@@ -84,10 +118,102 @@ Options:
 
 ```text
 -h, --help     show help
--v, --version  show the version
+-v, --version  show version
 ```
 
-Exit codes:
+Normal output goes to `stdout`; errors go to `stderr`.
+
+### Save a link
+
+```sh
+linkbrarian "https://odin-lang.org/docs/overview/"
+```
+
+Example output:
+
+```text
+[+] Link saved: Overview | Odin Programming Language
+    URL: https://odin-lang.org/docs/overview/
+```
+
+At this point the link is in the database, but no notes folder has been
+created.
+
+### Add notes to the same link
+
+```sh
+linkbrarian "https://odin-lang.org/docs/overview/" note
+```
+
+Example output:
+
+```text
+[=] Link already registered: Overview | Odin Programming Language
+    URL: https://odin-lang.org/docs/overview/
+[+] Notes created: /home/you/.linkbrarian/overview-odin-programming-language-1-notes
+```
+
+The notes operation is safe to repeat. Existing files are never overwritten:
+
+```text
+[=] Notes already exist: /home/you/.linkbrarian/overview-odin-programming-language-1-notes
+```
+
+### Register and document the example links
+
+These popular documentation links are useful for trying the complete workflow.
+The first command registers a link without notes; the others register and create
+their notes folders in one step:
+
+```sh
+linkbrarian "https://odin-lang.org/docs/overview/"
+
+lbr "https://en.cppreference.com/c/language" note
+lbr "https://docs.python.org/3/extending/index.html" note
+lbr "https://www.lua.org/manual/5.5/" note
+lbr "https://docs.kicad.org/10.0/en/getting_started_in_kicad/getting_started_in_kicad.html" note
+lbr "https://wiki.freecad.org/Getting_started" note
+```
+
+Titles are fetched when a URL is first registered. If a site is temporarily
+unreachable or does not provide a usable HTML title, the host is stored instead
+(for example `www.lua.org`); the URL is still saved and notes still work.
+
+To assign the notes folder to the first link afterwards:
+
+```sh
+lbr "https://odin-lang.org/docs/overview/" note
+```
+
+### Inspect the catalogue
+
+Unix-like systems:
+
+```sh
+sqlite3 "$HOME/.linkbrarian/linkography.db" \
+  "SELECT id, n, page_name, notes_path FROM links ORDER BY id;"
+```
+
+PowerShell:
+
+```powershell
+sqlite3 "$env:USERPROFILE\.linkbrarian\linkography.db" `
+  "SELECT id, n, page_name, notes_path FROM links ORDER BY id;"
+```
+
+### Edit notes
+
+The generated note is an ordinary Markdown file. Open it with any editor:
+
+```sh
+$EDITOR "$HOME/.linkbrarian/overview-odin-programming-language-1-notes/README.md"
+```
+
+Running `note` again will not replace your text. The database only stores the
+folder path; images, transcripts and other files can be added to that folder
+manually.
+
+### Exit codes
 
 | Code | Meaning |
 |---:|---|
@@ -96,8 +222,6 @@ Exit codes:
 | `2` | invalid URL |
 | `3` | storage or database error |
 | `4` | notes folder could not be created |
-
-Normal output goes to `stdout`; errors go to `stderr`.
 
 ## Storage
 
@@ -108,7 +232,7 @@ Data lives in the user's home directory:
 | Windows | `%USERPROFILE%\.linkbrarian\` | `%USERPROFILE%\.linkbrarian\linkography.db` |
 | Unix-like | `$HOME/.linkbrarian/` | `$HOME/.linkbrarian/linkography.db` |
 
-`.linkbrarian` is created automatically (mode `0700` on Unix-like systems).
+`.linkbrarian` is created automatically with mode `0700` on Unix-like systems.
 The current working directory is never used for storage.
 
 ## Behaviour
@@ -209,8 +333,10 @@ database with a newer schema version is rejected rather than modified.
 
 ## Tests
 
+Unix-like systems:
+
 ```sh
-make check
+ctest --test-dir build --output-on-failure
 ```
 
 The suite uses a temporary `HOME`, a local fixture HTTP server and HTML
@@ -227,23 +353,22 @@ profile. It covers:
 - the `lbr` alias
 - concurrent inserts assigning unique `n` values
 
-The permission-failure case is skipped when the suite runs as `root`, because
-root bypasses Unix mode bits.
+The test harness is POSIX shell and is enabled only when CMake runs on a
+Unix-like system. It also needs the `sqlite3` command-line tool. The
+permission-failure case is skipped when the suite runs as `root`, because root
+bypasses Unix mode bits.
 
 ## Windows
 
-Build with MSYS2/MinGW-w64 and the SQLite/libcurl packages, for example:
+1. Install CMake, Visual Studio with the C workload, and vcpkg.
+2. Install `sqlite3:x64-windows` and `curl:x64-windows` with vcpkg.
+3. Configure with the vcpkg toolchain file, build with `--config Release`, and
+   optionally install as shown above.
 
-```sh
-pacman -S mingw-w64-x86_64-gcc make \
-          mingw-w64-x86_64-sqlite3 mingw-w64-x86_64-curl
-make
-```
-
-The Makefile's `lbr` step uses `cp`, which is available in the MSYS2 shell. If
-your environment does not provide it, copy `linkbrarian.exe` to `lbr.exe`
-manually; the program does not depend on `argv[0]`. Paths use the native
-separator and `%USERPROFILE%` is used for the home directory.
+The Windows build uses the native path separator and `%USERPROFILE%` for the
+home directory. `linkbrarian.exe` and `lbr.exe` are separate executables; the
+program does not depend on `argv[0]`. The automated fixture tests are not built
+on Windows because the harness is POSIX shell.
 
 ## Limits
 
@@ -259,3 +384,5 @@ Additional implementation notes:
 - Slugs are ASCII, so titles written only in non-Latin scripts fall back to the
   name `link` (with collision disambiguators).
 - URL comparison is conservative: only surrounding whitespace is trimmed.
+- Notes are ordinary files owned by the user; the database stores only their
+  folder path.

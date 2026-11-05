@@ -3,10 +3,10 @@
 set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
-BIN="$ROOT/linkbrarian"
-LBR="$ROOT/lbr"
-HTTPD="$ROOT/tests/httpd"
-FIXTURES="$ROOT/tests/fixtures"
+BIN=${LINKBRARIAN_BIN:-"$ROOT/build/linkbrarian"}
+LBR=${LBR_BIN:-"$ROOT/build/lbr"}
+HTTPD=${HTTPD_BIN:-"$ROOT/build/linkbrarian_fixture_httpd"}
+FIXTURES=${FIXTURES:-"$ROOT/tests/fixtures"}
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/linkbrarian-test.XXXXXX") || exit 1
 SRV=
@@ -92,10 +92,12 @@ name_for()
 	dbq "SELECT page_name FROM links WHERE link = '$1';"
 }
 
-make -C "$ROOT" >/dev/null 2>&1 || {
-	printf 'FAIL: build failed\n' >&2
-	exit 1
-}
+for prog in "$BIN" "$LBR" "$HTTPD"; do
+	if [ ! -x "$prog" ]; then
+		printf 'FAIL: %s not found; build with CMake first\n' "$prog" >&2
+		exit 1
+	fi
+done
 
 "$HTTPD" 0 "$FIXTURES" >"$TMP/port" 2>"$TMP/httpd.log" &
 SRV=$!

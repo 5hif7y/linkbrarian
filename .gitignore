@@ -1,4 +1,7 @@
-linkbrarian
-lbr
-*.o
-tests/httpd
+/build/
+/cmake-build-*/
+/out/
+/compile_commands.json
+/CMakeUserPresets.json
+/.vs/
+*.user

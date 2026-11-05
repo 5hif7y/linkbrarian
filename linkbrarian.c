@@ -29,7 +29,7 @@
 #define strncasecmp _strnicmp
 #define PATHSEP '\\'
 #ifndef S_ISDIR
-#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
 #endif
 #else
 #include <fcntl.h>
@@ -1284,9 +1284,6 @@ int main(int argc, char **argv)
 	if (!valid_url(url, &host))
 		die(EXIT_BAD_URL, "invalid URL (expected absolute http or https): %s",
 		    url);
-	if (!fetch_page_title(url, &page_name))
-		page_name = xstrdup(host);
-	page_name_key = normalize_key(page_name);
 
 	home = home_directory();
 	data_dir = path_join(home, ".linkbrarian");
@@ -1299,7 +1296,13 @@ int main(int argc, char **argv)
 		is_new = 0;
 	} else {
 		long long id = 0, n = 0;
-		int rc = db_insert_link(db, page_name, page_name_key, url, &id, &n);
+		int rc;
+
+		/* Fetch metadata only for new links; existing records keep their title. */
+		if (!fetch_page_title(url, &page_name))
+			page_name = xstrdup(host);
+		page_name_key = normalize_key(page_name);
+		rc = db_insert_link(db, page_name, page_name_key, url, &id, &n);
 
 		if (rc == 1) {
 			if (!db_find_link(db, url, &row))
