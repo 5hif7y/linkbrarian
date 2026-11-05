@@ -18,4 +18,4 @@
 #define EXIT_NOTES 4
 
 /* SQLite schema version */
-#define SCHEMA_VERSION 2
+#define SCHEMA_VERSION 3

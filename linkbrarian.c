@@ -932,6 +932,219 @@ static int valid_url(const char *url, char **host)
 	return 1;
 }
 
+/* ---------- URL identity ---------- */
+
+static int hex_digit(unsigned char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+static char upper_hex(int v)
+{
+	return (char)(v < 10 ? '0' + v : 'A' + v - 10);
+}
+
+static int url_unreserved(unsigned char c)
+{
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+	       (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+	       c == '~';
+}
+
+static void lowercase_ascii(char *s)
+{
+	while (*s) {
+		if (*s >= 'A' && *s <= 'Z')
+			*s += 32;
+		s++;
+	}
+}
+
+static char *normalize_path_escapes(const char *path)
+{
+	struct sbuf out = {0};
+	size_t i = 0;
+
+	while (path[i]) {
+		if (path[i] == '%') {
+			int hi = hex_digit((unsigned char)path[i + 1]);
+			int lo = hi >= 0 ? hex_digit((unsigned char)path[i + 2]) : -1;
+
+			if (hi >= 0 && lo >= 0) {
+				unsigned char c = (unsigned char)((hi << 4) | lo);
+
+				if (url_unreserved(c)) {
+					sb_add(&out, (const char *)&c, 1);
+				} else {
+					char esc[3] = { '%', upper_hex(hi), upper_hex(lo) };
+
+					sb_add(&out, esc, 3);
+				}
+				i += 3;
+				continue;
+			}
+		}
+		sb_add(&out, path + i, 1);
+		i++;
+	}
+	return out.s ? out.s : xstrdup("");
+}
+
+static void drop_last_segment(struct sbuf *out)
+{
+	while (out->len && out->s[out->len - 1] != '/')
+		out->len--;
+	if (out->len)
+		out->len--;
+	if (out->s)
+		out->s[out->len] = '\0';
+}
+
+static char *remove_dot_segments(const char *path)
+{
+	struct sbuf out = {0};
+	const char *in = path;
+
+	while (*in) {
+		if (!strncmp(in, "../", 3)) {
+			in += 3;
+		} else if (!strncmp(in, "./", 2)) {
+			in += 2;
+		} else if (!strncmp(in, "/./", 3)) {
+			in += 2;
+		} else if (!strcmp(in, "/.")) {
+			in += 2;
+			sb_add(&out, "/", 1);
+		} else if (!strncmp(in, "/../", 4)) {
+			in += 3;
+			drop_last_segment(&out);
+		} else if (!strcmp(in, "/..")) {
+			in += 3;
+			drop_last_segment(&out);
+			sb_add(&out, "/", 1);
+		} else if (!strcmp(in, ".") || !strcmp(in, "..")) {
+			in += strlen(in);
+		} else {
+			const char *start = in;
+
+			if (*in == '/')
+				in++;
+			while (*in && *in != '/')
+				in++;
+			sb_add(&out, start, (size_t)(in - start));
+		}
+	}
+	return out.s ? out.s : xstrdup("");
+}
+
+/*
+ * Conservative RFC 3986-style identity key:
+ * - lower-case scheme and host
+ * - remove the default port
+ * - upper-case percent escapes, decode only unreserved characters
+ * - remove dot segments from the path
+ * Query, fragment, path case and trailing slashes are preserved.
+ */
+static char *canonical_url(const char *url)
+{
+	const char *sep = strstr(url, "://");
+	const char *authority, *auth_end, *p, *last_at = NULL;
+	const char *host_start, *host_end, *port = NULL;
+	const char *path_end, *frag, *query_start = NULL, *query_end = NULL;
+	size_t port_len = 0;
+	char *scheme, *host, *raw_path, *escaped_path, *path;
+	struct sbuf out = {0};
+	int drop_port = 0;
+
+	if (!sep)
+		return xstrdup(url);
+	authority = sep + 3;
+	auth_end = authority;
+	while (*auth_end && *auth_end != '/' && *auth_end != '?' &&
+	       *auth_end != '#')
+		auth_end++;
+	for (p = authority; p < auth_end; p++) {
+		if (*p == '@')
+			last_at = p;
+	}
+	host_start = last_at ? last_at + 1 : authority;
+	host_end = auth_end;
+	if (host_start < auth_end && *host_start == '[') {
+		const char *close = memchr(host_start, ']',
+					   (size_t)(auth_end - host_start));
+
+		if (close) {
+			host_end = close + 1;
+			if (host_end < auth_end && *host_end == ':') {
+				port = host_end + 1;
+				port_len = (size_t)(auth_end - host_end - 1);
+			}
+		}
+	} else {
+		for (p = host_start; p < auth_end; p++) {
+			if (*p == ':') {
+				host_end = p;
+				port = p + 1;
+				port_len = (size_t)(auth_end - p - 1);
+			}
+		}
+	}
+
+	scheme = xstrndup(url, (size_t)(sep - url));
+	lowercase_ascii(scheme);
+	host = xstrndup(host_start, (size_t)(host_end - host_start));
+	lowercase_ascii(host);
+
+	if (port) {
+		if ((!strcmp(scheme, "http") && port_len == 2 &&
+		     !memcmp(port, "80", 2)) ||
+		    (!strcmp(scheme, "https") && port_len == 3 &&
+		     !memcmp(port, "443", 3)))
+			drop_port = 1;
+	}
+
+	path_end = auth_end;
+	while (*path_end && *path_end != '?' && *path_end != '#')
+		path_end++;
+	frag = strchr(path_end, '#');
+	if (*path_end == '?') {
+		query_start = path_end;
+		query_end = frag ? frag : path_end + strlen(path_end);
+	}
+
+	raw_path = xstrndup(auth_end, (size_t)(path_end - auth_end));
+	escaped_path = normalize_path_escapes(raw_path);
+	path = remove_dot_segments(escaped_path);
+
+	sb_add(&out, scheme, strlen(scheme));
+	sb_add(&out, "://", 3);
+	if (last_at)
+		sb_add(&out, authority, (size_t)(host_start - authority));
+	sb_add(&out, host, strlen(host));
+	if (port && !drop_port) {
+		sb_add(&out, ":", 1);
+		sb_add(&out, port, port_len);
+	}
+	sb_add(&out, path, strlen(path));
+	if (query_start)
+		sb_add(&out, query_start, (size_t)(query_end - query_start));
+	if (frag)
+		sb_add(&out, frag, strlen(frag));
+
+	free(scheme);
+	free(host);
+	free(raw_path);
+	free(escaped_path);
+	free(path);
+	return out.s ? out.s : xstrdup("");
+}
+
 /* ---------- SQLite ---------- */
 
 static void db_exec(sqlite3 *db, const char *sql)
@@ -1095,14 +1308,83 @@ static void db_migrate_v1_to_v2(sqlite3 *db)
 	db_exec(db, "PRAGMA user_version = 2");
 }
 
+static int db_migrate_v2_to_v3(sqlite3 *db)
+{
+	sqlite3_stmt *select, *exists, *update;
+	int rc, conflicts = 0;
+
+	db_exec(db, "ALTER TABLE links ADD COLUMN link_key TEXT");
+	select = db_prepare(db, "SELECT id, link FROM links ORDER BY id");
+	exists = db_prepare(db,
+			    "SELECT 1 FROM links WHERE link_key = ?1 LIMIT 1");
+	update = db_prepare(db,
+			    "UPDATE links SET link_key = ?1 WHERE id = ?2");
+
+	while ((rc = sqlite3_step(select)) == SQLITE_ROW) {
+		const char *link = (const char *)sqlite3_column_text(select, 1);
+		char *key = canonical_url(link ? link : "");
+
+		sqlite3_reset(exists);
+		sqlite3_clear_bindings(exists);
+		sqlite3_bind_text(exists, 1, key, -1, SQLITE_TRANSIENT);
+		rc = sqlite3_step(exists);
+		if (rc == SQLITE_ROW) {
+			/*
+			 * Older exact-URL rows may canonicalize to the same key.
+			 * Keep both; the oldest keeps the key, later ones stay NULL.
+			 */
+			conflicts++;
+			free(key);
+			continue;
+		}
+		if (rc != SQLITE_DONE) {
+			free(key);
+			sqlite3_finalize(select);
+			sqlite3_finalize(exists);
+			sqlite3_finalize(update);
+			die(EXIT_STORAGE, "database migration failed: %s",
+			    sqlite3_errmsg(db));
+		}
+		sqlite3_reset(update);
+		sqlite3_clear_bindings(update);
+		sqlite3_bind_text(update, 1, key, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_int64(update, 2, sqlite3_column_int64(select, 0));
+		free(key);
+		if (sqlite3_step(update) != SQLITE_DONE) {
+			sqlite3_finalize(select);
+			sqlite3_finalize(exists);
+			sqlite3_finalize(update);
+			die(EXIT_STORAGE, "database migration failed: %s",
+			    sqlite3_errmsg(db));
+		}
+	}
+	if (rc != SQLITE_DONE) {
+		sqlite3_finalize(select);
+		sqlite3_finalize(exists);
+		sqlite3_finalize(update);
+		die(EXIT_STORAGE, "database migration failed: %s",
+		    sqlite3_errmsg(db));
+	}
+	sqlite3_finalize(select);
+	sqlite3_finalize(exists);
+	sqlite3_finalize(update);
+
+	db_exec(db,
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_links_link_key"
+		" ON links (link_key) WHERE link_key IS NOT NULL");
+	db_exec(db, "PRAGMA user_version = 3");
+	return conflicts;
+}
+
 static void db_init(sqlite3 *db)
 {
 	int version = db_user_version(db);
+	int conflicts = 0;
 
 	if (version > SCHEMA_VERSION)
 		die(EXIT_STORAGE, "database schema %d is newer than supported schema %d",
 		    version, SCHEMA_VERSION);
-	if (version == 0 || version == 1) {
+	if (version == 0 || version == 1 || version == 2) {
 		/*
 		 * BEGIN IMMEDIATE serialises schema creation and migration. The
 		 * version is read again after taking the write lock, because another
@@ -1121,12 +1403,19 @@ static void db_init(sqlite3 *db)
 			db_exec(db,
 				"CREATE INDEX IF NOT EXISTS idx_links_page_name"
 				" ON links (page_name_key)");
-			db_exec(db, "PRAGMA user_version = 2");
-		} else if (version == 1) {
-			db_migrate_v1_to_v2(db);
+			conflicts = db_migrate_v2_to_v3(db);
+		} else {
+			if (version == 1)
+				db_migrate_v1_to_v2(db);
+			if (version <= 2)
+				conflicts = db_migrate_v2_to_v3(db);
 		}
 		db_exec(db, "COMMIT");
 	}
+	if (conflicts)
+		fprintf(stderr,
+			"linkbrarian: warning: %d existing links share a canonical URL; kept with link_key=NULL\n",
+			conflicts);
 }
 
 static char *column_text_dup(sqlite3_stmt *st, int col)
@@ -1136,7 +1425,8 @@ static char *column_text_dup(sqlite3_stmt *st, int col)
 	return p ? xstrdup((const char *)p) : NULL;
 }
 
-static int db_find_link(sqlite3 *db, const char *url, struct link_row *row)
+static int db_find_link(sqlite3 *db, const char *url, const char *url_key,
+			struct link_row *row)
 {
 	sqlite3_stmt *st;
 	int rc, found = 0;
@@ -1144,8 +1434,10 @@ static int db_find_link(sqlite3 *db, const char *url, struct link_row *row)
 	memset(row, 0, sizeof(*row));
 	st = db_prepare(db,
 			"SELECT id, page_name, link, notes_path, n"
-			" FROM links WHERE link = ?1");
-	sqlite3_bind_text(st, 1, url, -1, SQLITE_TRANSIENT);
+			" FROM links WHERE link_key = ?1 OR link = ?2"
+			" ORDER BY (link_key = ?1) DESC, id LIMIT 1");
+	sqlite3_bind_text(st, 1, url_key, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_text(st, 2, url, -1, SQLITE_TRANSIENT);
 	rc = sqlite3_step(st);
 	if (rc == SQLITE_ROW) {
 		row->id = (long long)sqlite3_column_int64(st, 0);
@@ -1191,7 +1483,7 @@ static int db_find_id(sqlite3 *db, long long id, struct link_row *row)
 /* 0: inserted, 1: link was inserted concurrently, exits on other errors. */
 static int db_insert_link(sqlite3 *db, const char *page_name,
 			  const char *page_name_key, const char *url,
-			  long long *id, long long *n)
+			  const char *url_key, long long *id, long long *n)
 {
 	sqlite3_stmt *st;
 	int rc;
@@ -1212,12 +1504,14 @@ static int db_insert_link(sqlite3 *db, const char *page_name,
 
 	st = db_prepare(db,
 			"INSERT INTO links"
-			" (page_name, page_name_key, link, tags, notes_path, n)"
-			" VALUES (?1, ?2, ?3, '', NULL, ?4)");
+			" (page_name, page_name_key, link, link_key, tags,"
+			"  notes_path, n)"
+			" VALUES (?1, ?2, ?3, ?4, '', NULL, ?5)");
 	sqlite3_bind_text(st, 1, page_name, -1, SQLITE_TRANSIENT);
 	sqlite3_bind_text(st, 2, page_name_key, -1, SQLITE_TRANSIENT);
 	sqlite3_bind_text(st, 3, url, -1, SQLITE_TRANSIENT);
-	sqlite3_bind_int64(st, 4, (sqlite3_int64)*n);
+	sqlite3_bind_text(st, 4, url_key, -1, SQLITE_TRANSIENT);
+	sqlite3_bind_int64(st, 5, (sqlite3_int64)*n);
 	rc = sqlite3_step(st);
 	if (rc != SQLITE_DONE) {
 		int code = sqlite3_errcode(db);
@@ -1421,6 +1715,7 @@ int main(int argc, char **argv)
 	int i, want_note = 0, is_new = 0, status = 0;
 	const char *arg;
 	char *url = NULL, *host = NULL, *page_name = NULL, *page_name_key = NULL;
+	char *url_key = NULL;
 	char *home = NULL, *data_dir = NULL, *db_path = NULL;
 	sqlite3 *db = NULL;
 	struct link_row row;
@@ -1478,6 +1773,7 @@ int main(int argc, char **argv)
 	if (!valid_url(url, &host))
 		die(EXIT_BAD_URL, "invalid URL (expected absolute http or https): %s",
 		    url);
+	url_key = canonical_url(url);
 
 	home = home_directory();
 	data_dir = path_join(home, ".linkbrarian");
@@ -1486,7 +1782,7 @@ int main(int argc, char **argv)
 	db = db_open(db_path);
 	db_init(db);
 
-	if (db_find_link(db, url, &row)) {
+	if (db_find_link(db, url, url_key, &row)) {
 		is_new = 0;
 	} else {
 		long long id = 0, n = 0;
@@ -1496,10 +1792,11 @@ int main(int argc, char **argv)
 		if (!fetch_page_title(url, &page_name))
 			page_name = xstrdup(host);
 		page_name_key = normalize_key(page_name);
-		rc = db_insert_link(db, page_name, page_name_key, url, &id, &n);
+		rc = db_insert_link(db, page_name, page_name_key, url, url_key,
+				    &id, &n);
 
 		if (rc == 1) {
-			if (!db_find_link(db, url, &row))
+			if (!db_find_link(db, url, url_key, &row))
 				die(EXIT_STORAGE, "link disappeared after insert conflict");
 			is_new = 0;
 		} else {
@@ -1581,6 +1878,7 @@ out:
 	free(db_path);
 	free(page_name);
 	free(page_name_key);
+	free(url_key);
 	free(host);
 	free(url);
 	return status;

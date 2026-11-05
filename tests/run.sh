@@ -119,7 +119,7 @@ run "$BIN" "$BASE/title.html"
 expect_ok "register a valid URL"
 [ -d "$HOME/.linkbrarian" ] || fail "data directory was not created"
 [ -f "$HOME/.linkbrarian/linkography.db" ] || fail "database was not created"
-[ "$(dbq 'PRAGMA user_version;')" = "2" ] || fail "schema version is not 2"
+[ "$(dbq 'PRAGMA user_version;')" = "3" ] || fail "schema version is not 3"
 [ "$(count_links)" = "1" ] || fail "expected one link"
 row=$(dbq "SELECT page_name || '|' || link || '|' || tags || '|' || COALESCE(notes_path, 'NULL') || '|' || n FROM links;")
 [ "$row" = "Example & Article|$BASE/title.html||NULL|1" ] ||
@@ -308,7 +308,7 @@ VALUES (3, '東京', '東京', 'https://example.com/c', '', '/tmp/old-notes', 1,
 SQL
 run "$BIN" "https://example.com/a"
 expect_ok "open and migrate v1 database"
-[ "$(dbq 'PRAGMA user_version;')" = "2" ] || fail "v1 database was not migrated to v2"
+[ "$(dbq 'PRAGMA user_version;')" = "3" ] || fail "v1 database was not migrated to v3"
 [ "$(dbq 'SELECT page_name_key FROM links WHERE id = 1;')" = "strasse" ] ||
 	fail "migration did not recompute page_name_key"
 [ "$(dbq 'SELECT n FROM links WHERE id = 2;')" = "2" ] ||
@@ -321,7 +321,91 @@ expect_ok "open and migrate v1 database"
 	fail "migration changed notes_path"
 [ "$(dbq 'SELECT created_at FROM links WHERE id = 1;')" = "2020-01-01 00:00:00" ] ||
 	fail "migration changed created_at"
+[ "$(dbq 'SELECT link_key FROM links WHERE id = 1;')" = "https://example.com/a" ] ||
+	fail "v1 migration did not add canonical link_key"
 ok "v1 databases migrate to NFKC keys without touching notes"
+
+# ------------------------------------------------- 6a: canonical URL identity
+new_home url-identity
+run "$BIN" "$BASE/title.html"
+expect_ok "save original URL"
+run "$BIN" "HTTP://127.0.0.1:$PORT/title.html"
+expect_ok "save upper-case scheme"
+run "$BIN" "$BASE/./title.html"
+expect_ok "save URL with a dot segment"
+run "$BIN" "$BASE/%74itle.html"
+expect_ok "save URL with a percent-encoded unreserved character"
+[ "$(count_links)" = "1" ] || fail "canonical URL variants created duplicate rows"
+out_has "[=] Link already registered" "canonical duplicate output"
+[ "$(dbq "SELECT link FROM links WHERE id = 1;")" = "$BASE/title.html" ] ||
+	fail "canonicalisation modified the stored raw URL"
+
+run "$BIN" "$BASE/title.html?x=1"
+expect_ok "save URL with query 1"
+run "$BIN" "$BASE/title.html?x=2"
+expect_ok "save URL with query 2"
+run "$BIN" "$BASE/title.html#fragment"
+expect_ok "save URL with a fragment"
+run "$BIN" "$BASE/title.html/"
+expect_ok "save URL with a trailing slash"
+[ "$(count_links)" = "5" ] ||
+	fail "query, fragment or trailing slash were canonicalised away"
+ok "canonical URL identity preserves query, fragment and trailing slash"
+
+new_home url-identity-extra
+run "$BIN" "http://LOCALHOST:$PORT/title.html"
+expect_ok "save upper-case host"
+run "$BIN" "http://localhost:$PORT/title.html"
+expect_ok "save lower-case host"
+[ "$(count_links)" = "1" ] || fail "host case created a duplicate row"
+
+run "$BIN" "http://127.0.0.1:80/port-test"
+expect_ok "save HTTP default port"
+run "$BIN" "http://127.0.0.1/port-test"
+expect_ok "save URL without HTTP default port"
+[ "$(count_links)" = "2" ] || fail "default port created a duplicate row"
+ok "canonical URL identity handles host case and default ports"
+
+# ------------------------------------------------ 6b: v2 database migration
+new_home url-migration
+mkdir -p "$HOME/.linkbrarian"
+sqlite3 "$HOME/.linkbrarian/linkography.db" <<SQL
+PRAGMA user_version = 2;
+CREATE TABLE links (
+    id INTEGER PRIMARY KEY,
+    page_name TEXT NOT NULL,
+    page_name_key TEXT NOT NULL,
+    link TEXT NOT NULL UNIQUE,
+    tags TEXT NOT NULL DEFAULT '',
+    notes_path TEXT,
+    n INTEGER NOT NULL CHECK (n >= 1),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (page_name_key, n)
+);
+CREATE INDEX idx_links_page_name ON links (page_name_key);
+INSERT INTO links (id, page_name, page_name_key, link, tags, notes_path, n, created_at)
+VALUES (1, 'A', 'a', 'https://Example.com/a', '', NULL, 1, '2020-01-01 00:00:00');
+INSERT INTO links (id, page_name, page_name_key, link, tags, notes_path, n, created_at)
+VALUES (2, 'B', 'b', 'https://example.com/a', '', NULL, 1, '2020-01-02 00:00:00');
+INSERT INTO links (id, page_name, page_name_key, link, tags, notes_path, n, created_at)
+VALUES (3, 'C', 'c', 'https://example.com/b', '', NULL, 1, '2020-01-03 00:00:00');
+SQL
+run "$BIN" "https://Example.com/a"
+expect_ok "open and migrate v2 database"
+[ "$(dbq 'PRAGMA user_version;')" = "3" ] || fail "v2 database was not migrated to v3"
+[ "$(count_links)" = "3" ] || fail "v2 migration changed the row count"
+[ "$(dbq 'SELECT link_key FROM links WHERE id = 1;')" = "https://example.com/a" ] ||
+	fail "v2 migration did not set the canonical key"
+[ "$(dbq 'SELECT link_key IS NULL FROM links WHERE id = 2;')" = "1" ] ||
+	fail "v2 migration should keep the later canonical conflict NULL"
+[ "$(dbq 'SELECT link FROM links WHERE id = 1;')" = "https://Example.com/a" ] ||
+	fail "v2 migration changed the raw URL"
+err_has "share a canonical URL" "v2 migration conflict warning"
+run "$BIN" "https://EXAMPLE.com/a"
+expect_ok "canonical lookup after migration"
+[ "$(count_links)" = "3" ] || fail "canonical lookup after migration created a row"
+out_has "[=] Link already registered: A" "canonical lookup after migration"
+ok "v2 databases migrate to canonical link keys with conflict handling"
 
 # ------------------------------------------------------- 6: duplicate URL
 new_home duplicate

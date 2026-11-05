@@ -257,10 +257,27 @@ HTML entities are decoded, tags inside the title are stripped and surrounding
 Unicode whitespace is removed. Tag and attribute names are matched
 case-insensitively.
 
+### URL identity
+
+`link` stores the original URL after trimming surrounding whitespace. A separate
+`link_key` column stores a conservative canonical identity:
+
+- scheme and host are lower-cased;
+- default ports (`:80` for HTTP, `:443` for HTTPS) are removed;
+- percent escapes are upper-cased and only unreserved characters are decoded;
+- path dot segments are removed.
+
+Path case, query strings, fragments, userinfo and trailing slashes are kept
+exactly. This means `HTTP://EXAMPLE.com:80/a/../b` and
+`http://example.com/b` identify the same link, while `?x=1`, `?x=2`,
+`#one`, `#two` and `/path/` vs `/path` remain distinct.
+
 ### Identity and numbering
 
 - `link` is unique. Running the command again for the same URL does not create
   another row; the existing record is reported.
+- `link_key` is unique when present, so trivially different spellings of the
+  same URL also resolve to the existing record.
 - Different URLs with the same visible title are distinct records.
 - `n` starts at `1` for the first record of a title and increments for each
   additional URL with the same title.
@@ -321,7 +338,7 @@ code page.
 
 ## Data model
 
-Schema version `2`, tracked with `PRAGMA user_version`:
+Schema version `3`, tracked with `PRAGMA user_version`:
 
 ```sql
 CREATE TABLE IF NOT EXISTS links (
@@ -329,6 +346,7 @@ CREATE TABLE IF NOT EXISTS links (
     page_name      TEXT NOT NULL,
     page_name_key  TEXT NOT NULL,
     link           TEXT NOT NULL UNIQUE,
+    link_key       TEXT,
     tags           TEXT NOT NULL DEFAULT '',
     notes_path     TEXT,
     n              INTEGER NOT NULL CHECK (n >= 1),
@@ -338,17 +356,25 @@ CREATE TABLE IF NOT EXISTS links (
 
 CREATE INDEX IF NOT EXISTS idx_links_page_name
     ON links (page_name_key);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_links_link_key
+    ON links (link_key) WHERE link_key IS NOT NULL;
 ```
 
 Initialisation is idempotent and does not destroy an existing database. A
 database with a newer schema version is rejected rather than modified.
 
-Databases created with schema version `1` are migrated in place on first open:
+Older databases are migrated in place on first open:
 
-- `page_name_key` is recomputed for every row with NFKC case folding.
-- `n` is renumbered sequentially per new key, preserving row ids and
-  `created_at`.
+- version `1` to `2`: `page_name_key` is recomputed with NFKC case folding and
+  `n` is renumbered per new key, preserving row ids and `created_at`;
+- version `2` to `3`: `link_key` is computed for every row and a unique partial
+  index is created;
 - `notes_path` is preserved exactly; existing note folders are not renamed.
+
+If two old rows canonicalise to the same `link_key`, the oldest keeps the key
+and the later rows keep `link_key = NULL`; a warning reports the count. The raw
+`link` values and notes are never changed.
 
 ## Tests
 
@@ -366,9 +392,15 @@ profile. It covers:
 - valid and invalid URL handling
 - `<title>`, `og:title`, entity decoding and host fallback
 - duplicate URLs and `n = 1`, `n = 2`
+- canonical URL identity for case, default ports, dot segments and percent
+  escapes
+- preservation of query strings, fragments and trailing slashes
+- migration of schema version `2` databases to canonical URL keys, including
+  conflict handling
 - NFKC case folding for Unicode-equivalent titles
 - Unicode notes slugs (Cyrillic, CJK, emoji)
-- migration of schema version `1` databases to version `2`
+- migration of schema version `1` databases through version `2` to the
+  current schema
 - notes creation, existing links without notes, and non-destructive repeats
 - special characters and slug collisions
 - filesystem failure without broken `notes_path` references
@@ -403,8 +435,8 @@ transcription downloads.
 Additional implementation notes:
 
 - HTML is assumed to be UTF-8; no charset conversion is performed.
-- URL comparison is conservative by design: only surrounding whitespace is
-  trimmed. Query strings, fragments and trailing slashes are preserved, so
-  trivially different spellings may be stored as separate links.
+- URL identity is conservative by design: canonicalisation does not merge path
+  case, query strings, fragments, trailing slashes, userinfo or Unicode/IDN host
+  variants.
 - Notes are ordinary files owned by the user; the database stores only their
   folder path.
