@@ -2314,8 +2314,8 @@ static int cmd_export(int argc, char **argv)
 	} else if (!strcmp(format, "csv")) {
 		puts("id,page_name,link,link_key,tags,notes_path,n,created_at");
 	} else {
-		puts("| ID | Page name | URL | Tags | Notes | N | Created |");
-		puts("|---:|---|---|---|---|---:|---|");
+		puts("| ID | Page name | URL | Key | Tags | Notes | N | Created |");
+		puts("|---:|---|---|---|---|---|---:|---|");
 	}
 
 	while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
@@ -2372,6 +2372,8 @@ static int cmd_export(int argc, char **argv)
 			markdown_field(name);
 			fputs(" | ", stdout);
 			markdown_field(link);
+			fputs(" | ", stdout);
+			markdown_field(link_key);
 			fputs(" | ", stdout);
 			markdown_field(tags);
 			fputs(" | ", stdout);

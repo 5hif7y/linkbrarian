@@ -504,9 +504,9 @@ because the harness is POSIX shell.
 
 ## Limits
 
-This is the registration-and-notes MVP. It does not implement search, tag
-editing, deletion, export, browser integration, cloud sync or automatic
-transcription downloads.
+Browser integration, cloud sync and automatic transcription downloads are not
+implemented. The local catalogue, notes, search, tags, deletion and export are
+available from the CLI.
 
 Additional implementation notes:
 

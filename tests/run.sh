@@ -550,7 +550,7 @@ out_has '"Comma, Title"' "CSV comma escaping"
 
 run "$BIN" export markdown
 expect_ok "Markdown export"
-out_has "| ID | Page name | URL | Tags | Notes | N | Created |" "Markdown header"
+out_has "| ID | Page name | URL | Key | Tags | Notes | N | Created |" "Markdown header"
 out_has 'A \| B' "Markdown pipe escaping"
 
 run "$BIN" export yaml
